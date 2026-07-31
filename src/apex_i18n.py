@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.95"
+APP_VERSION = "0.96"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -85,6 +85,8 @@ _EN = {
     "底图：": "Base map:",
     "放大": "Zoom in", "缩小": "Zoom out",
     "定位我的城市": "Locate my city",
+    "搜索地点，如：柳州": "Search a place, e.g. Liuzhou",
+    "搜索": "Search",
     "同步 UOM 适飞区": "Sync UOM fly zones",
     "UOM 适飞区同步": "UOM fly-zone sync",
     "单击地图放置起飞点标记，坐标供 UOM 空域申请填表使用":
@@ -233,6 +235,12 @@ _EN = {
     "Ollama 运行中": "Ollama running",
     "未检测到 Ollama 服务": "Ollama not detected",
     "Ollama 运行中，但还没有安装模型": "Ollama running, no model installed",
+    "性能匹配": "Match for my PC",
+    "点「性能匹配」自动检测本机配置并推荐模型":
+        "Click [Match] to detect your PC and pick the right model",
+    "一键拉取推荐模型": "Pull recommended model",
+    "一键拉取": "Pull",
+    "重试拉取": "Retry pull",
     # ---- 常用确认对话框 ----
     "确认写入": "Confirm write", "确认恢复": "Confirm restore",
     "确认删除": "Confirm delete", "确认应用预设": "Confirm preset",

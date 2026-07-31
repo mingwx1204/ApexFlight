@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ApexFlight 适飞地图（v0.93）：纯 QWidget 实现的瓦片地图。
 
-- 底图：高德卫星图（默认）/ 卫星+路网标注 / 高德矢量图，可切换
+- 底图：卫星+路网标注（默认）/ 高德卫星图 / 高德矢量图，可切换
 - 交互：拖动平移、滚轮/按钮缩放、单击放置起飞点标记
 - 坐标：高德瓦片为 GCJ-02 火星坐标；起飞点同时显示 WGS-84
   换算值（供 UOM 空域申请填表使用，精确到小数点后 6 位）
@@ -140,20 +140,30 @@ def world_to_lonlat(x: float, y: float, zoom: int) -> tuple:
 # 瓦片下载管理器：后台线程 + 内存/磁盘双缓存
 # ------------------------------------------------------------
 class TileManager(QObject):
-    """瓦片请求队列：去重、磁盘缓存命中直接回、网络失败记空标记"""
+    """瓦片请求队列：去重、磁盘缓存命中直接回、网络失败记空标记。
+
+    v0.96 提速：
+    - 4 个下载线程并行（原来是 1 个串行，缩放时一片一片慢慢出）
+    - 双队列：可视区高优 / 预取低优（可视区永远先下）
+    - 预取：可视区外扩一圈 + 相邻缩放级同区域，提前进缓存
+    - 内存缓存上限 800 张，超出一次性清一半
+    """
 
     tile_ready = pyqtSignal(str, int, int, int)   # layer, z, x, y
     fetch_failed = pyqtSignal(str)
 
+    WORKERS = 4
+
     def __init__(self):
         super().__init__()
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()        # 可视区（高优）
+        self._prefetch: queue.Queue = queue.Queue()     # 预取（低优）
         self._pending: set = set()
         self._memory: dict = {}                    # key -> QImage
         self._failed: set = set()                  # 失败的 key 不再重试
         self._not_on_disk: set = set()             # 负缓存：磁盘没有就不再查
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        for _ in range(self.WORKERS):
+            threading.Thread(target=self._loop, daemon=True).start()
 
     @staticmethod
     def _key(layer: str, z: int, x: int, y: int) -> str:
@@ -163,8 +173,8 @@ class TileManager(QObject):
     def _path(key: str) -> str:
         return str(CACHE_DIR / f"{key}.png")
 
-    def get(self, layer: str, url_tpl: str, z: int, x: int, y: int):
-        """取瓦片：命中返回 QImage，未命中排队下载并返回 None"""
+    def _cached_or_queue(self, layer: str, url_tpl: str,
+                         z: int, x: int, y: int, q: queue.Queue):
         key = self._key(layer, z, x, y)
         img = self._memory.get(key)
         if img is not None:
@@ -172,22 +182,35 @@ class TileManager(QObject):
         if key in self._failed:
             return None
         path = self._path(key)
-        if key not in self._not_on_disk and os.path.exists(path):
-            img = QImage(path)
-            if not img.isNull():
-                self._memory[key] = img
-                return img
-            self._not_on_disk.add(key)      # 坏文件只查一次
-        elif key not in self._not_on_disk:
-            self._not_on_disk.add(key)      # 不存在也只查一次
+        if key not in self._not_on_disk:
+            if os.path.exists(path):
+                img = QImage(path)
+                if not img.isNull():
+                    self._memory[key] = img
+                    return img
+            self._not_on_disk.add(key)      # 磁盘查一次就够
         if key not in self._pending:
             self._pending.add(key)
-            self._queue.put((key, url_tpl, z, x, y))
+            q.put((key, url_tpl, z, x, y))
         return None
+
+    def get(self, layer: str, url_tpl: str, z: int, x: int, y: int):
+        """可视区瓦片：命中返回 QImage，未命中进高优队列并返回 None"""
+        return self._cached_or_queue(layer, url_tpl, z, x, y, self._queue)
+
+    def prefetch(self, layer: str, url_tpl: str, z: int, x: int, y: int):
+        """预取瓦片（低优后台下载，不追求立即显示）"""
+        if 0 <= z <= MAX_ZOOM:
+            self._cached_or_queue(layer, url_tpl, z, x, y, self._prefetch)
 
     def _loop(self):
         while True:
-            key, url_tpl, z, x, y = self._queue.get()
+            # 先清空高优队列，才碰预取队列
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                item = self._prefetch.get()      # 阻塞等预取任务
+            key, url_tpl, z, x, y = item
             try:
                 url = (url_tpl.replace("{s}", _SUBDOMAINS[(x + y) % 4])
                        .replace("{x}", str(x)).replace("{y}", str(y))
@@ -199,6 +222,9 @@ class TileManager(QObject):
                 if img.isNull():
                     raise ValueError("图片解码失败")
                 self._memory[key] = img
+                if len(self._memory) > 800:      # 简单上限，防无限膨胀
+                    for old in list(self._memory.keys())[:400]:
+                        self._memory.pop(old, None)
                 try:
                     os.makedirs(os.path.dirname(self._path(key)),
                                 exist_ok=True)
@@ -227,7 +253,7 @@ class SlippyMapWidget(QWidget):
         self.setMouseTracking(True)
         self.tiles = TileManager()
         self.tiles.tile_ready.connect(lambda *_: self.update())
-        self.source_name = "高德卫星图"
+        self.source_name = "卫星+路网标注"      # 默认混合图：卫星+路名地名
         # 默认视图：中国全域
         self.center_lon = 108.9
         self.center_lat = 34.3
@@ -246,6 +272,8 @@ class SlippyMapWidget(QWidget):
 
     # ---- 状态 ----
     def set_source(self, name: str):
+        if name not in TILE_SOURCES:          # 语言切换后的异常文本不炸
+            return
         self.source_name = name
         self.update()
 
@@ -323,6 +351,35 @@ class SlippyMapWidget(QWidget):
                 if not drew and self._backdrop_pm is None:
                     p.fillRect(int(px), int(py), TILE, TILE,
                                QColor("#1A1D22"))
+
+        # 预取：可视区外扩一圈 + 相邻缩放级中心区域（低优后台下载；
+        # 之后平移/缩放过去时直接命中缓存，不再干等）
+        budget = 24                               # 每次重绘最多补 24 张
+
+        def _pf(z_, tx_, ty_, n_):
+            nonlocal budget
+            if budget <= 0 or tx_ < 0 or ty_ < 0 or tx_ >= n_ or ty_ >= n_:
+                return
+            for layer in src["layers"]:
+                self.tiles.prefetch(layer, src[layer], z_, tx_, ty_)
+            budget -= 1
+
+        for tx in range(x0 - 1, x1 + 2):          # 当前级外扩一圈
+            for ty in range(y0 - 1, y1 + 2):
+                if x0 <= tx <= x1 and y0 <= ty <= y1:
+                    continue                      # 可视区走高优队列了
+                _pf(self.zoom, tx, ty, n)
+        for dz in (1, -1):                        # 相邻缩放级中心 3×3
+            z2 = self.zoom + dz
+            if not (MIN_ZOOM <= z2 <= MAX_ZOOM):
+                continue
+            n2 = 2 ** z2
+            f = 2.0 ** dz
+            ctx = int(cx * f) // TILE
+            cty = int(cy * f) // TILE
+            for tx in range(ctx - 1, ctx + 2):
+                for ty in range(cty - 1, cty + 2):
+                    _pf(z2, tx, ty, n2)
 
         # 起飞点标记（青色图钉 + 圆环，大图标看得清）
         if self.marker is not None:

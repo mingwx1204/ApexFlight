@@ -951,6 +951,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel(tr("底图：")))
         self.map_source_combo = QComboBox()
         self.map_source_combo.addItems(list(TILE_SOURCES.keys()))
+        self.map_source_combo.setCurrentText("卫星+路网标注")   # 与控件默认一致
         self.map_source_combo.setMinimumWidth(150)
         bar.addWidget(self.map_source_combo)
         zoom_in = QPushButton("＋ " + tr("放大"))
@@ -960,8 +961,18 @@ class MainWindow(QMainWindow):
         bar.addWidget(zoom_in)
         bar.addWidget(zoom_out)
         locate_btn = QPushButton("📍 " + tr("定位我的城市"))
-        locate_btn.clicked.connect(self._map_locate_ip)
+        locate_btn.clicked.connect(self._map_locate)
         bar.addWidget(locate_btn)
+        # 地点搜索：比定位更可靠的主动找点方式（IP/WiFi 定位都可能漂）
+        self.map_search_edit = QLineEdit()
+        self.map_search_edit.setPlaceholderText(tr("搜索地点，如：柳州"))
+        self.map_search_edit.setClearButtonEnabled(True)
+        self.map_search_edit.setMaximumWidth(200)
+        self.map_search_edit.returnPressed.connect(self._map_search)
+        bar.addWidget(self.map_search_edit)
+        search_btn = QPushButton("🔍 " + tr("搜索"))
+        search_btn.clicked.connect(self._map_search)
+        bar.addWidget(search_btn)
         uom_btn = QPushButton("🗺️ " + tr("同步 UOM 适飞区"))
         uom_btn.setObjectName("connectBtn")
         uom_btn.clicked.connect(self._map_sync_uom)
@@ -1008,10 +1019,84 @@ class MainWindow(QMainWindow):
             return
         self._copy_text(f"{wlon:.6f},{wlat:.6f}")
 
-    def _map_locate_ip(self):
-        """IP 粗定位：双数据源（ip-api 中文城市名优先，ipinfo 兜底），
-        定位后放置起飞点标记并如实提示精度"""
-        self.statusBar().showMessage("正在通过 IP 定位……")
+    def _map_locate(self):
+        """定位：优先系统定位服务（QtPositioning，Windows 位置服务 /
+        WiFi 定位，精度远高于 IP）；不可用 / 无权限 / 超时则回退
+        IP 粗定位。任何一步失败都不会卡死界面。"""
+        self.statusBar().showMessage("正在定位（优先系统定位服务）……")
+        self._geo_done = False
+        try:
+            from PyQt6.QtPositioning import QGeoPositionInfoSource
+            src = QGeoPositionInfoSource.createDefaultSource(self)
+        except Exception as e:                    # 模块缺失/插件异常
+            log_event(f"系统定位不可用：{e}")
+            self._map_locate_ip_fallback("系统定位服务不可用")
+            return
+        if src is None:
+            self._map_locate_ip_fallback("本机无系统定位服务")
+            return
+        self._geo_src = src                       # 防被 GC
+        src.positionUpdated.connect(self._on_geo_position)
+        if hasattr(src, "errorOccurred"):
+            src.errorOccurred.connect(self._on_geo_error)
+        # 兜底定时器：10 秒内没有任何结果就走 IP 回退
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.setInterval(10000)
+        self._geo_timer.timeout.connect(
+            lambda: self._geo_give_up("系统定位超时"))
+        self._geo_timer.start()
+        src.requestUpdate(8000)                   # 单次定位，内部 8s 超时
+
+    def _on_geo_position(self, info):
+        """系统定位成功：WGS-84 → GCJ-02 落图，精度如实提示"""
+        if getattr(self, "_geo_done", True):
+            return
+        self._geo_done = True
+        self._geo_timer.stop()
+        try:
+            from PyQt6.QtPositioning import QGeoPositionInfo
+            coord = info.coordinate()
+            if not coord.isValid():
+                raise ValueError("坐标无效")
+            lat, lon = coord.latitude(), coord.longitude()
+            acc = info.attribute(
+                QGeoPositionInfo.Attribute.HorizontalAccuracy)
+        except Exception as e:
+            self._geo_give_up(f"系统定位结果异常（{e}）")
+            return
+        from apex_map import wgs84_to_gcj02
+        glon, glat = wgs84_to_gcj02(lon, lat)
+        self.map_widget.set_center(glon, glat, 14)
+        self.map_widget.marker = (glon, glat)
+        self.map_widget.marker_changed.emit(glon, glat)
+        self.map_widget.update()
+        acc_txt = (f"，误差约 {int(acc)} 米" if acc and 0 < acc < 50000
+                   else "（WiFi 定位，精度较高）")
+        self.statusBar().showMessage(
+            f"已通过系统定位服务定位{acc_txt}；起飞点可再拖动精调", 8000)
+        log_event(f"系统定位成功：{lat:.5f},{lon:.5f}")
+
+    def _on_geo_error(self, *_):
+        self._geo_give_up("系统定位失败（可在 Windows 设置→隐私→位置 开启）")
+
+    def _geo_give_up(self, reason: str):
+        """系统定位没戏了：清理状态，回退 IP 粗定位"""
+        if getattr(self, "_geo_done", False):
+            return
+        self._geo_done = True
+        try:
+            self._geo_timer.stop()
+        except Exception:
+            pass
+        log_event(f"{reason}，回退 IP 定位")
+        self._map_locate_ip_fallback(reason)
+
+    def _map_locate_ip_fallback(self, reason: str = ""):
+        """IP 粗定位（回退方案）：双数据源（ip-api 中文城市名优先，
+        ipinfo 兜底），定位后放置起飞点标记并如实提示精度"""
+        prefix = f"{reason}，改用 IP 粗定位……" if reason else "正在通过 IP 定位……"
+        self.statusBar().showMessage(prefix)
 
         def work():
             import json as _json
@@ -1045,10 +1130,53 @@ class MainWindow(QMainWindow):
             self.map_widget.update()
             where = f"：{city}" if city else ""
             self.statusBar().showMessage(
-                f"已定位{where}（IP 定位基于运营商出口，可能偏差几公里，"
-                f"请拖动地图手动精调起飞点）", 8000)
+                f"已定位{where}（IP 定位基于运营商出口，连手机热点时会漂到"
+                f"号码归属地，请拖动地图或用搜索框精调起飞点）", 9000)
 
         self._run_simple_task(work, done, "IP 定位失败：检查网络后重试")
+
+    def _map_search(self):
+        """地点搜索：Nominatim 地理编码（WGS-84 → GCJ-02 落图）。
+        定位不准时最可靠的找点方式——直接搜地名。"""
+        q = self.map_search_edit.text().strip()
+        if not q:
+            self.statusBar().showMessage("先输入要搜索的地点，如：柳州", 4000)
+            return
+        self.statusBar().showMessage(f"正在搜索「{q}」……")
+
+        def work():
+            import json as _json
+            import urllib.parse as _up
+            import urllib.request as _u
+            url = ("https://nominatim.openstreetmap.org/search?q="
+                   + _up.quote(q)
+                   + "&format=json&limit=1&accept-language=zh-CN")
+            req = _u.Request(url, headers={
+                "User-Agent": "ApexFlight/0.96 (local drone configurator)"})
+            with _u.urlopen(req, timeout=8) as r:
+                arr = _json.loads(r.read().decode())
+            if not arr:
+                raise ValueError("没找到这个地点，换个关键词（如加上省/市）试试")
+            d = arr[0]
+            name = str(d.get("display_name", q))
+            for sep in ("，", ","):
+                name = name.split(sep)[0]
+            return float(d["lat"]), float(d["lon"]), name
+
+        def done(result):
+            lat, lon, name = result
+            from apex_map import wgs84_to_gcj02
+            glon, glat = wgs84_to_gcj02(lon, lat)
+            self.map_widget.set_center(glon, glat, 13)
+            self.map_widget.marker = (glon, glat)
+            self.map_widget.marker_changed.emit(glon, glat)
+            self.map_widget.update()
+            self.statusBar().showMessage(
+                f"已定位到：{name}（单击地图可微调起飞点）", 6000)
+            log_event(f"地点搜索：{q} → {lat:.5f},{lon:.5f}")
+
+        self._run_simple_task(
+            work, done, "搜索失败（网络受限时可改用定位按钮或手动拖动）")
 
     def _map_sync_uom(self):
         """同步 UOM 适飞区：实测连通性后如实说明——UOM 空域数据
@@ -1088,28 +1216,26 @@ class MainWindow(QMainWindow):
             log_event("已打开 UOM 平台官网")
 
     def _run_simple_task(self, work, done, err_hint: str):
-        """在后台线程跑无参函数 work()，UI 线程回调 done(result)"""
+        """在后台线程跑无参函数 work()，UI 线程回调 done(result)。
+
+        每次调用独立闭包状态，多个任务并发（如边搜索边下载）互不干扰。"""
         import threading as _th
+        state = {}
 
         def runner():
             try:
-                result = work()
+                state["result"] = work()
             except Exception as e:
-                self._simple_task_err = f"{err_hint}（{e}）"
-                result = None
-            self._simple_task_result = result
-            QTimer.singleShot(0, self._simple_task_finish)
+                state["err"] = f"{err_hint}（{e}）"
+            QTimer.singleShot(0, finish)
 
-        self._simple_task_done = done
+        def finish():
+            if "err" in state:
+                self.statusBar().showMessage(state["err"], 7000)
+                return
+            done(state.get("result"))
+
         _th.Thread(target=runner, daemon=True).start()
-
-    def _simple_task_finish(self):
-        result = getattr(self, "_simple_task_result", None)
-        if result is None:
-            self.statusBar().showMessage(
-                getattr(self, "_simple_task_err", "操作失败"), 6000)
-            return
-        self._simple_task_done(result)
 
     # ---------- 页签 10：应用日志（参考 BF Configurator 日志页） ----------
 
@@ -2863,7 +2989,8 @@ class MainWindow(QMainWindow):
 
         # ---- 顶部：服务状态 + 模型选择 ----
         top = QGroupBox("本地 AI 服务（Ollama）")
-        top_row = QHBoxLayout(top)
+        top_col = QVBoxLayout(top)
+        top_row = QHBoxLayout()
         self.ai_status_label = QLabel("检测中……")
         top_row.addWidget(self.ai_status_label)
         top_row.addWidget(QLabel("模型："))
@@ -2876,6 +3003,25 @@ class MainWindow(QMainWindow):
         self.ai_install_btn = QPushButton("📦 安装指引")
         self.ai_install_btn.clicked.connect(self.on_ai_install_help)
         top_row.addWidget(self.ai_install_btn)
+        top_col.addLayout(top_row)
+
+        # ---- 第二行：按本机性能匹配最优模型（v0.96）----
+        match_row = QHBoxLayout()
+        self.ai_match_btn = QPushButton("⚡ " + tr("性能匹配"))
+        self.ai_match_btn.setToolTip(
+            "检测本机 CPU / 内存 / 显卡，推荐最合适的调参大模型；\n"
+            "模型越大分析越全面，但也越吃配置——匹配错了会卡。")
+        self.ai_match_btn.clicked.connect(self.on_ai_match_hw)
+        match_row.addWidget(self.ai_match_btn)
+        self.ai_match_label = QLabel(
+            tr("点「性能匹配」自动检测本机配置并推荐模型"))
+        self.ai_match_label.setStyleSheet("color: #9AA0A6;")
+        match_row.addWidget(self.ai_match_label, 1)
+        self.ai_pull_btn = QPushButton("📥 " + tr("一键拉取推荐模型"))
+        self.ai_pull_btn.setVisible(False)        # 检测后确有需要才出现
+        self.ai_pull_btn.clicked.connect(self.on_ai_pull_recommended)
+        match_row.addWidget(self.ai_pull_btn)
+        top_col.addLayout(match_row)
         layout.addWidget(top)
 
         # ---- 快捷分析按钮 ----
@@ -2967,6 +3113,99 @@ class MainWindow(QMainWindow):
         self.ai_status_label.setText("检测中……")
         self.ai_status_label.setStyleSheet("")
         self._run_in_thread(self._ai_probe_and_emit)
+
+    # ---------- AI 助手：按本机性能匹配模型（v0.96）----------
+
+    def on_ai_match_hw(self):
+        """检测本机硬件并推荐调参模型；已装则选中，没装给一键拉取"""
+        self.ai_match_label.setText("正在检测本机硬件（CPU / 内存 / 显卡）……")
+        self.ai_match_label.setStyleSheet("color: #9AA0A6;")
+        self.ai_pull_btn.setVisible(False)
+
+        def work():
+            from apex_ai import detect_hardware, recommend_model
+            hw = detect_hardware()
+            model, reason, desc = recommend_model(hw)
+            running, models = ollama_status()
+            return model, reason, desc, running, models
+
+        def done(result):
+            model, reason, desc, running, models = result
+            self._ai_recommended = model
+            text = f"本机：{desc} → 推荐 {model}（{reason}）"
+            log_event(f"AI 性能匹配：{desc} → 推荐 {model}")
+            if running and model in models:
+                idx = self.ai_model_combo.findText(model)
+                if idx >= 0:
+                    self.ai_model_combo.setCurrentIndex(idx)
+                text += "，已安装并选中 ✓"
+                self.ai_match_label.setStyleSheet("color: #6FCF97;")
+            elif running:
+                self.ai_pull_btn.setText(f"📥 {tr('一键拉取')} {model}")
+                self.ai_pull_btn.setVisible(True)
+                self.ai_match_label.setStyleSheet("color: #3EC6E8;")
+            else:
+                text += "（Ollama 未运行，先按「安装指引」装好再拉取）"
+                self.ai_match_label.setStyleSheet("color: #F5A83D;")
+            self.ai_match_label.setText(text)
+
+        self._run_simple_task(work, done, "硬件检测失败")
+
+    def on_ai_pull_recommended(self):
+        """后台执行 ollama pull 拉取推荐模型，进度轮询显示在状态栏"""
+        model = getattr(self, "_ai_recommended", "")
+        if not model:
+            return
+        self.ai_pull_btn.setEnabled(False)
+        self.ai_pull_btn.setText(f"⏳ 正在拉取 {model} …")
+        self.ai_chat_view.append(
+            f"<span style='color:#9AA0A6;'>📥 开始下载模型 {model}，"
+            f"模型较大可能要几分钟，进度见底部状态栏……</span>")
+        self._pull_progress = f"正在连接 Ollama 拉取 {model} ……"
+        self._pull_timer = QTimer(self)
+        self._pull_timer.setInterval(600)
+        self._pull_timer.timeout.connect(
+            lambda: self.statusBar().showMessage(
+                "📥 " + str(getattr(self, "_pull_progress", ""))[:90]))
+        self._pull_timer.start()
+
+        def work():
+            try:
+                import subprocess
+                proc = subprocess.Popen(
+                    ["ollama", "pull", model],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="ignore",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                for line in proc.stdout or []:
+                    line = line.strip()
+                    if line:
+                        self._pull_progress = line   # 状态栏轮询读取
+                return proc.wait()
+            except Exception as e:
+                return f"error:{e}"
+
+        def done(rc):
+            self._pull_timer.stop()
+            self.statusBar().clearMessage()
+            self.ai_pull_btn.setEnabled(True)
+            if rc == 0:
+                self.ai_pull_btn.setVisible(False)
+                self.ai_pull_btn.setText("📥 " + tr("一键拉取推荐模型"))
+                self.ai_chat_view.append(
+                    f"<span style='color:#6FCF97;'>✅ 模型 {model} "
+                    f"下载完成，正在刷新模型列表……</span>")
+                log_event(f"AI 模型拉取完成：{model}")
+                self.on_ai_refresh()
+            else:
+                detail = (str(rc)[6:] if str(rc).startswith("error:")
+                          else getattr(self, "_pull_progress", "未知原因"))
+                self.ai_pull_btn.setText("📥 " + tr("重试拉取"))
+                self.ai_chat_view.append(
+                    f"<span style='color:#E06C75;'>❌ 拉取失败：{detail}。"
+                    f"可在终端手动执行 ollama pull {model}</span>")
+
+        self._run_simple_task(work, done, f"拉取 {model} 失败")
 
     def on_ai_install_help(self):
         QMessageBox.information(

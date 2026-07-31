@@ -69,6 +69,133 @@ def extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+# ------------------------------------------------------------
+# v0.96：按电脑性能匹配最优本地调参模型
+# ------------------------------------------------------------
+def detect_hardware() -> dict:
+    """检测本机硬件（全标准库 + 可选 PowerShell / nvidia-smi，任何一步
+    失败都降级处理，绝不抛异常）：
+    {"cpu": 线程数, "ram_gb": 内存GB, "gpu": 显卡名, "vram_gb": 显存GB}"""
+    import os
+    hw = {"cpu": os.cpu_count() or 0, "ram_gb": 0.0,
+          "gpu": "", "vram_gb": 0.0}
+    # 物理内存：Windows GlobalMemoryStatusEx
+    try:
+        import ctypes
+
+        class _MEMSTAT(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = _MEMSTAT()
+        st.dwLength = ctypes.sizeof(_MEMSTAT)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            hw["ram_gb"] = round(st.ullTotalPhys / (1024 ** 3), 1)
+    except Exception:
+        pass
+    # 显卡名：PowerShell WMI（独显优先），启动隐藏窗口。
+    # 有些环境 PATH 不含 System32，先 which 再找系统目录绝对路径
+    ps = None
+    try:
+        import shutil
+        ps = shutil.which("powershell")
+        if not ps:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
+            cand = (buf.value + "\\WindowsPowerShell\\v1.0\\powershell.exe")
+            if os.path.exists(cand):
+                ps = cand
+    except Exception:
+        pass
+    if ps:
+        try:
+            import subprocess
+            out = subprocess.run(
+                [ps, "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_VideoController | "
+                 "Sort-Object -Descending AdapterRAM | "
+                 "Select-Object -First 1 -ExpandProperty Name)"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            hw["gpu"] = (out.stdout or "").strip().splitlines()[0] \
+                if out.stdout and out.stdout.strip() else ""
+        except Exception:
+            pass
+    # 显存：N 卡用 nvidia-smi 精确拿（WMI 的 AdapterRAM 对 >4GB 不可靠）。
+    # nvidia-smi 默认装在 NVSMI 目录，常不在 PATH
+    if "nvidia" in hw["gpu"].lower():
+        try:
+            import shutil
+            smi = shutil.which("nvidia-smi")
+            if not smi:
+                for cand in (
+                        os.path.join(
+                            os.environ.get("SystemRoot", r"C:\Windows"),
+                            "System32", "nvidia-smi.exe"),
+                        os.path.join(
+                            os.environ.get("ProgramFiles", r"C:\Program Files"),
+                            "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe")):
+                    if os.path.exists(cand):
+                        smi = cand
+                        break
+            if smi:
+                import subprocess
+                out = subprocess.run(
+                    [smi, "--query-gpu=memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                hw["vram_gb"] = round(int(out.stdout.strip()) / 1024, 1)
+        except Exception:
+            pass
+    return hw
+
+
+# 推荐档位：(最小RAM GB, 模型, 理由)——从高到低匹配
+_MODEL_TIERS = [
+    (32, "qwen2.5:14b", "分析最全面，适合深度黑匣子诊断"),
+    (14, "qwen2.5:7b", "质量与速度平衡，多数电脑的最佳选择"),
+    (7, "qwen2.5:3b", "轻快省内存，日常使用足够"),
+    (0, "qwen2.5:1.5b", "极低配置保底，回答较简略"),
+]
+
+
+def recommend_model(hw: dict) -> tuple:
+    """按硬件推荐模型，返回 (模型名, 理由, 本机描述)。
+    规则：按 RAM 分档；N 卡显存 ≥10GB 升一档（GPU 推理快得多）。"""
+    ram = hw.get("ram_gb", 0.0)
+    vram = hw.get("vram_gb", 0.0)
+    idx = next((i for i, (need, _, _) in enumerate(_MODEL_TIERS)
+                if ram >= need), len(_MODEL_TIERS) - 1)
+    upgraded = False
+    if vram >= 10 and idx > 0:
+        idx -= 1
+        upgraded = True
+    _, model, reason = _MODEL_TIERS[idx]
+    parts = []
+    if hw.get("cpu"):
+        parts.append(f"{hw['cpu']} 线程")
+    if ram:
+        parts.append(f"{ram:.0f}GB 内存")
+    if hw.get("gpu"):
+        gpu = hw["gpu"]
+        if vram:
+            gpu += f"（{vram:.0f}GB 显存）"
+        parts.append(gpu)
+    desc = " / ".join(parts) or "硬件信息读取失败"
+    if upgraded:
+        reason += f"；检测到 {vram:.0f}GB 显存，已上调一档"
+    return model, reason, desc
+
+
 class AIBridge(QObject):
     """AI 对话桥：在后台线程调用 Ollama，流式输出通过信号送回界面"""
 
