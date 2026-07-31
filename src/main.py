@@ -554,6 +554,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_stylesheet()
         self._connect_signals()
+        # 启动时应用非中文语言（设置里切换则立即生效）
+        if i18n.get_language() != "zh":
+            self.retranslate_ui()
 
         # 慢通道定时器：700ms 刷一次电压/CPU/解锁标志
         self.poll_timer = QTimer(self)
@@ -961,6 +964,19 @@ class MainWindow(QMainWindow):
         log_btn.clicked.connect(self._open_log_folder)
         form.addRow(tr("日志") + "：", log_btn)
 
+        # 用户反馈通道（v0.9）：跳转 GitHub Issues + 一键复制诊断信息
+        fb_row = QHBoxLayout()
+        fb_btn = QPushButton("💬 " + tr("在 GitHub 上提交建议/问题"))
+        fb_btn.clicked.connect(self._open_feedback)
+        fb_row.addWidget(fb_btn)
+        diag_btn = QPushButton("📋 " + tr("复制诊断信息"))
+        diag_btn.clicked.connect(self._copy_diagnostics)
+        fb_row.addWidget(diag_btn)
+        fb_wrap = QWidget()
+        fb_wrap.setLayout(fb_row)
+        fb_row.setContentsMargins(0, 0, 0, 0)
+        form.addRow(tr("意见反馈") + "：", fb_wrap)
+
         about = QLabel(
             f"{i18n.APP_NAME} v{i18n.APP_VERSION} · GPL-3.0<br>"
             "github.com/mingwx1204/ApexFlight")
@@ -991,24 +1007,72 @@ class MainWindow(QMainWindow):
         log_event(f"设置已保存（语言={self._cfg['language']}，"
                   f"默认波特率={self._cfg['baud']}）")
 
+    FEEDBACK_URL = "https://github.com/mingwx1204/ApexFlight/issues/new"
+
+    def _open_feedback(self):
+        """用户反馈通道：打开 GitHub Issues 新建页（浏览器）"""
+        import webbrowser
+        webbrowser.open(self.FEEDBACK_URL)
+        log_event("已打开意见反馈页面（GitHub Issues）")
+
+    def _copy_diagnostics(self):
+        """复制诊断信息到剪贴板：版本/系统/固件 + 最近 10 条日志，
+        用户在 GitHub Issue 里直接粘贴即可"""
+        import platform
+        lines = [
+            f"ApexFlight v{i18n.APP_VERSION}",
+            f"OS: {platform.system()} {platform.release()} "
+            f"({platform.machine()})",
+            f"Firmware: {self.firmware_label.text()}",
+            f"Board: {self.board_label.text()}",
+        ]
+        with _app_log_lock:
+            tail = _app_log_lines[-10:]
+        text = "\n".join(lines) + "\n\nRecent log:\n" + "\n".join(tail)
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage(
+            tr("诊断信息已复制，到 GitHub Issues 粘贴即可"))
+
     def retranslate_ui(self):
-        """语言切换后刷新：窗口标题、侧栏、顶栏、日志页按钮"""
+        """语言切换后全量刷新（立即生效，无需重启）：
+        窗口标题 + 侧栏 + 递归遍历全部控件做双向翻译"""
         self.setWindowTitle(f"{i18n.APP_NAME} v{i18n.APP_VERSION}")
+        # 侧栏条目（图标 + 名称键）
         row = self.sidebar.currentRow()
         for i, (icon, name) in enumerate(self._sidebar_entries):
             item = self.sidebar.item(i)
             if item:
                 item.setText(f"{icon}  {tr(name)}")
         self.sidebar.setCurrentRow(row)
-        self.lbl_port.setText(tr("串口"))
-        self.lbl_baud.setText(tr("波特率"))
-        self.refresh_button.setText(tr("刷新"))
-        self.connect_button.setText(tr("连接"))
-        self.disconnect_button.setText(tr("断开"))
-        self.settings_button.setText("⚙ " + tr("设置"))
-        self.log_clear_btn.setText(tr("清空"))
-        self.log_save_btn.setText(tr("另存为…"))
-        self.log_open_btn.setText(tr("打开日志文件夹"))
+        self._retranslate_widget_tree(self)
+
+    @staticmethod
+    def _retranslate_widget_tree(root: QWidget):
+        """递归遍历控件树，翻译所有静态文本（中↔英 双向）。
+
+        覆盖：QLabel / QPushButton / QCheckBox / QAbstractButton（含开关）
+        / QGroupBox 标题 / QComboBox 条目。纯 ASCII 与含变量的动态文本
+        会被 localize_text 自动跳过。"""
+        from PyQt6.QtWidgets import QComboBox
+        for w in root.findChildren(QWidget):
+            try:
+                if isinstance(w, QGroupBox):
+                    new = i18n.localize_text(w.title())
+                    if new != w.title():
+                        w.setTitle(new)
+                elif isinstance(w, QComboBox):
+                    for i in range(w.count()):
+                        t = w.itemText(i)
+                        new = i18n.localize_text(t)
+                        if new != t:
+                            w.setItemText(i, new)
+                elif isinstance(w, (QLabel, QAbstractButton)):
+                    t = w.text()
+                    new = i18n.localize_text(t)
+                    if new != t:
+                        w.setText(new)
+            except RuntimeError:
+                pass                      # 控件可能已被销毁
 
     # ---------- 页签 1：仪表盘 ----------
 
@@ -1673,7 +1737,7 @@ class MainWindow(QMainWindow):
                     f"{display}：均值 {sum(values)/len(values):.1f}，"
                     f"范围 {min(values):.0f} ~ {max(values):.0f}")
 
-        self.bb_axes[-1].set_xlabel("时间 (秒)", color="#E8E8E8")
+        self.bb_axes[-1].set_xlabel(tr("时间 (秒)"), color="#E8E8E8")
         title = "归一化对比" if normalize else "黑匣子数据轨道"
         self.bb_axes[0].set_title(title, color="#3EC6E8")
         fig.tight_layout()
@@ -1833,9 +1897,9 @@ class MainWindow(QMainWindow):
                                 color=color, fontsize=8, ha="center")
                     peak_notes.append(f"{display} 噪声峰 ≈ {f:.0f} Hz")
 
-        ax.set_xlabel("频率 (Hz)", color="#E8E8E8")
-        ax.set_ylabel("幅度", color="#E8E8E8")
-        ax.set_title("频谱分析（噪声峰位置决定滤波器截止频率）",
+        ax.set_xlabel(tr("频率 (Hz)"), color="#E8E8E8")
+        ax.set_ylabel(tr("幅度"), color="#E8E8E8")
+        ax.set_title(tr("频谱分析（噪声峰位置决定滤波器截止频率）"),
                      color="#3EC6E8")
         ax.legend(loc="upper right", fontsize=8,
                   facecolor="#23272E", labelcolor="#E8E8E8")
@@ -2065,12 +2129,12 @@ class MainWindow(QMainWindow):
             ax1.plot([s * 100 for s in sticks], curve, color=color,
                      linewidth=1.2, label=axis_name)
             self._rates_max_labels[axis].setText(f"{curve[-1]:.0f}")
-        title = "Rates 预览"
+        title = tr("Rates 预览")
         if parsed.get("rates_type", 0) != 0:
             title += "（固件为非经典类型，仅供参考）"
         ax1.set_title(title, color="#3EC6E8", fontsize=10)
-        ax1.set_xlabel("摇杆偏转 (%)", color="#E8E8E8", fontsize=8)
-        ax1.set_ylabel("角速度 (°/s)", color="#E8E8E8", fontsize=8)
+        ax1.set_xlabel(tr("摇杆偏转 (%)"), color="#E8E8E8", fontsize=8)
+        ax1.set_ylabel(tr("角速度 (°/s)"), color="#E8E8E8", fontsize=8)
         ax1.legend(loc="upper left", fontsize=8, facecolor="#23272E",
                    labelcolor="#E8E8E8")
         ax1.grid(True, alpha=0.2, color="#9AA0A6")
@@ -2087,9 +2151,9 @@ class MainWindow(QMainWindow):
                  color="#F5A83D", linewidth=1.2)
         ax2.plot([mid * 100], [mid * 100], "o", color="#3EC6E8",
                  markersize=5)
-        ax2.set_title("油门曲线预览", color="#3EC6E8", fontsize=10)
-        ax2.set_xlabel("油门输入 (%)", color="#E8E8E8", fontsize=8)
-        ax2.set_ylabel("油门输出 (%)", color="#E8E8E8", fontsize=8)
+        ax2.set_title(tr("油门曲线预览"), color="#3EC6E8", fontsize=10)
+        ax2.set_xlabel(tr("油门输入 (%)"), color="#E8E8E8", fontsize=8)
+        ax2.set_ylabel(tr("油门输出 (%)"), color="#E8E8E8", fontsize=8)
         ax2.grid(True, alpha=0.2, color="#9AA0A6")
         ax2.tick_params(colors="#9AA0A6", labelsize=8)
         for spine in ax2.spines.values():

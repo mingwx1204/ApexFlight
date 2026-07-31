@@ -113,20 +113,39 @@ m.log_event("冒烟测试日志事件")
 app.processEvents()
 check("日志页显示事件", "冒烟测试日志事件" in win.log_view.toPlainText())
 
-# 11. v0.9：语言切换到英文再切回
+# 11. v0.9：语言切换到英文再切回（全界面立即生效）
 i18n.set_language("en")
 win.retranslate_ui()
 app.processEvents()
 item0 = win.sidebar.item(0).text()
 check("英文侧栏", "Dashboard" in item0, item0)
 check("英文顶栏按钮", win.connect_button.text() == "Connect")
+# 页面内部也应切换：仪表盘分组、Rates 分组、按钮
+from PyQt6.QtWidgets import QGroupBox as _GB, QPushButton as _PB, QLabel
+titles = {w.title() for w in win.findChildren(_GB)}
+check("英文分组标题（飞控信息）", "FC Info" in titles, str(titles)[:120])
+check("英文分组标题（油门）", "Throttle" in titles)
+check("英文分组标题（双日志对比）", "Dual-log compare" in titles)
+btns = {w.text() for w in win.findChildren(_PB)}
+check("英文按钮（保存）", "Save" in btns)
+check("英文按钮（频谱分析）", any("FFT" in b for b in btns))
+labels = {w.text() for w in win.findChildren(QLabel)}
+check("英文表单标签", "Firmware:" in labels)
+check("英文滤波器字段", any("Min cutoff (Hz)" in l for l in labels))
+# 切回中文：应完整还原
 i18n.set_language("zh")
 win.retranslate_ui()
 app.processEvents()
 check("切回中文侧栏", "仪表盘" in win.sidebar.item(0).text())
 check("切回中文按钮", win.connect_button.text() == "连接")
+titles_zh = {w.title() for w in win.findChildren(_GB)}
+check("中文还原（飞控信息）", "飞控信息" in titles_zh)
+check("中文还原（油门）", "油门" in titles_zh)
 
-# 12. v0.9：配置保存/读取往返
+# 12. v0.9：诊断信息复制 + 配置往返
+win._copy_diagnostics()
+clip = QApplication.clipboard().text()
+check("诊断信息含版本号", i18n.APP_VERSION in clip, clip[:80])
 cfg = i18n.load_config()
 cfg["language"] = "zh"
 i18n.save_config(cfg)

@@ -43,3 +43,4 @@ tools/*.exe
 *.spec
 assets/icon.ico
 config.json
+release/
