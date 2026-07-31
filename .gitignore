@@ -44,3 +44,4 @@ tools/*.exe
 assets/icon.ico
 config.json
 release/
+map_cache/

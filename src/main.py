@@ -93,6 +93,8 @@ from apex_ai import *        # noqa: F401,F403  AI 助手
 from apex_widgets import *   # noqa: F401,F403  自定义控件
 import apex_i18n as i18n     # 版本号 / 配置 / 多语言
 from apex_i18n import tr     # 界面翻译
+from apex_virtual import (    # v0.93：虚拟飞控（无真机体验全部功能）
+    VIRTUAL_PORT, VIRTUAL_PORT_LABEL, VirtualSerial)
 
 
 # ------------------------------------------------------------
@@ -160,13 +162,19 @@ class SerialWorker(QObject):
         try:
             self.status.emit("正在打开串口……")
             self.close_port()
-            self.serial_port = serial.Serial(
-                port=port, baudrate=baudrate,
-                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.2, write_timeout=2,
-            )
-            time.sleep(0.5)                   # 等待飞控串口稳定
+            if port == VIRTUAL_PORT:
+                # v0.93：虚拟连接——用仿真飞控替代真实串口，
+                # 后续所有 MSP 查询/写入走同一条代码路径
+                self.serial_port = VirtualSerial()
+                self.status.emit("虚拟模式：正在启动仿真飞控……")
+            else:
+                self.serial_port = serial.Serial(
+                    port=port, baudrate=baudrate,
+                    bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.2, write_timeout=2,
+                )
+                time.sleep(0.5)               # 等待飞控串口稳定
 
             self.status.emit("正在获取飞控信息……")
             self.fc_info = query_flight_controller(self.serial_port)
@@ -562,8 +570,8 @@ class MainWindow(QMainWindow):
         i18n.init_from_config(self._cfg)
 
         self.setWindowTitle(f"{i18n.APP_NAME} v{i18n.APP_VERSION}")
-        self.resize(1280, 800)                # v0.91：默认更大工作区
-        self.setMinimumSize(1080, 680)
+        self.resize(1360, 850)                # v0.93：字号加大后同步放大工作区
+        self.setMinimumSize(1160, 730)
         self._center_on_screen()
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -598,7 +606,7 @@ class MainWindow(QMainWindow):
                 background: #1B1E23;
                 color: #E8E8E8;
                 font-family: "Microsoft YaHei", "Segoe UI";
-                font-size: 13px;
+                font-size: 15px;
             }
             /* 顶栏 */
             QWidget#topbar {
@@ -607,7 +615,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#titleLabel {
                 color: #3EC6E8;
-                font-size: 20px;
+                font-size: 23px;
                 font-weight: bold;
                 padding-left: 4px;
             }
@@ -618,9 +626,10 @@ class MainWindow(QMainWindow):
                 border: none;
                 border-right: 1px solid #363C44;
                 outline: none;
+                font-size: 16px;
             }
             QListWidget#sidebar::item {
-                padding: 14px 12px;
+                padding: 15px 14px;
                 color: #9AA0A6;
                 border-left: 3px solid transparent;
             }
@@ -650,7 +659,7 @@ class MainWindow(QMainWindow):
                 background: #2E333B;
                 border: 1px solid #454C55;
                 border-radius: 6px;
-                padding: 6px 14px;
+                padding: 8px 16px;
                 color: #E8E8E8;
             }
             QPushButton:hover { background: #383F48; border-color: #3EC6E8; }
@@ -684,7 +693,7 @@ class MainWindow(QMainWindow):
                 background: #2E333B;
                 border: 1px solid #454C55;
                 border-radius: 6px;
-                padding: 5px 8px;
+                padding: 7px 10px;
             }
             QComboBox:hover { border-color: #3EC6E8; }
             QComboBox QAbstractItemView {
@@ -702,7 +711,7 @@ class MainWindow(QMainWindow):
             QHeaderView::section {
                 background: #2E333B;
                 color: #3EC6E8;
-                padding: 6px;
+                padding: 8px;
                 border: none;
                 font-weight: bold;
             }
@@ -800,7 +809,7 @@ class MainWindow(QMainWindow):
         if ICON_PATH.exists():
             icon_label = QLabel()
             icon_label.setPixmap(QPixmap(str(ICON_PATH)).scaled(
-                36, 36, Qt.AspectRatioMode.KeepAspectRatio,
+                42, 42, Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation))
             top.addWidget(icon_label)
 
@@ -809,7 +818,7 @@ class MainWindow(QMainWindow):
         top.addWidget(title)
         version_label = QLabel(f"v{i18n.APP_VERSION}")
         version_label.setObjectName("versionLabel")
-        version_label.setStyleSheet("color: #7A828C; font-size: 13px; "
+        version_label.setStyleSheet("color: #7A828C; font-size: 14px; "
                                     "padding-top: 4px;")
         self._version_label = version_label
         top.addWidget(version_label)
@@ -851,7 +860,7 @@ class MainWindow(QMainWindow):
 
         self.sidebar = QListWidget()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(168)       # v0.91：加宽，长页面名不挤压
+        self.sidebar.setFixedWidth(196)       # v0.93：字号加大后同步加宽
         self.sidebar.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # 隐藏横向滚动条
         # 侧栏条目 = 图标 + 名称键（名称键用于 i18n 翻译）
@@ -860,6 +869,7 @@ class MainWindow(QMainWindow):
             ("📊", "仪表盘"), ("🎛️", "PID 调参"), ("🎯", "Rates 调参"),
             ("🌊", "滤波器"), ("⚙️", "电机测试"), ("📡", "接收机"),
             ("📈", "黑匣子"), ("💾", "调参方案"), ("🤖", "AI 助手"),
+            ("🗺️", "适飞地图"),
             ("📜", "日志"),
         ]
         self.sidebar.addItems([f"{ic}  {tr(name)}"
@@ -878,6 +888,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._build_blackbox_tab())
         self.pages.addWidget(self._build_preset_tab())
         self.pages.addWidget(self._build_ai_tab())
+        self.pages.addWidget(self._build_map_tab())
         self.pages.addWidget(self._build_log_tab())
         body.addWidget(self.pages, 1)
 
@@ -911,6 +922,162 @@ class MainWindow(QMainWindow):
         anim.setEndValue(1.0)
         anim.finished.connect(lambda: page.setGraphicsEffect(None))
         anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    # ---------- 页签 11：适飞地图（v0.93，高德卫星图 + UOM 空域工具） ----------
+
+    def _build_map_tab(self) -> QWidget:
+        """适飞地图页：卫星图底图切换、起飞点标记与坐标复制、UOM 入口"""
+        from apex_map import SlippyMapWidget, TILE_SOURCES, gcj02_to_wgs84
+        self._gcj02_to_wgs84 = gcj02_to_wgs84   # 处理器里复用
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # 顶栏：底图切换 + 缩放 + 定位 + UOM
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel(tr("底图：")))
+        self.map_source_combo = QComboBox()
+        self.map_source_combo.addItems(list(TILE_SOURCES.keys()))
+        self.map_source_combo.setMinimumWidth(150)
+        bar.addWidget(self.map_source_combo)
+        zoom_in = QPushButton("＋ " + tr("放大"))
+        zoom_in.clicked.connect(lambda: self.map_widget.zoom_in())
+        zoom_out = QPushButton("－ " + tr("缩小"))
+        zoom_out.clicked.connect(lambda: self.map_widget.zoom_out())
+        bar.addWidget(zoom_in)
+        bar.addWidget(zoom_out)
+        locate_btn = QPushButton("📍 " + tr("定位我的城市"))
+        locate_btn.clicked.connect(self._map_locate_ip)
+        bar.addWidget(locate_btn)
+        uom_btn = QPushButton("🗺️ " + tr("同步 UOM 适飞区"))
+        uom_btn.setObjectName("connectBtn")
+        uom_btn.clicked.connect(self._map_sync_uom)
+        bar.addWidget(uom_btn)
+        bar.addStretch()
+        layout.addLayout(bar)
+
+        # 地图本体
+        self.map_widget = SlippyMapWidget()
+        self.map_source_combo.currentTextChanged.connect(
+            self.map_widget.set_source)
+        self.map_widget.marker_changed.connect(self._on_map_marker)
+        layout.addWidget(self.map_widget, 1)
+
+        # 底栏：起飞点坐标（GCJ-02 + WGS-84）+ 复制 + UOM 提示
+        bottom = QHBoxLayout()
+        self.map_marker_label = QLabel(
+            tr("单击地图放置起飞点标记，坐标供 UOM 空域申请填表使用"))
+        self.map_marker_label.setStyleSheet(
+            "color: #9AA0A6; font-size: 14px;")
+        bottom.addWidget(self.map_marker_label, 1)
+        self.map_copy_btn = QPushButton("📋 " + tr("复制坐标"))
+        self.map_copy_btn.setEnabled(False)
+        self.map_copy_btn.clicked.connect(self._map_copy_coords)
+        bottom.addWidget(self.map_copy_btn)
+        layout.addLayout(bottom)
+        return tab
+
+    def _on_map_marker(self, lon: float, lat: float):
+        """起飞点标记更新：同时显示 GCJ-02 与 WGS-84 坐标"""
+        wlon, wlat = self._gcj02_to_wgs84(lon, lat)
+        self._map_wgs = (wlon, wlat)
+        self.map_marker_label.setText(
+            f"📍 起飞点  GCJ-02：{lon:.6f}, {lat:.6f}    "
+            f"WGS-84：{wlon:.6f}, {wlat:.6f}")
+        self.map_marker_label.setStyleSheet(
+            "color: #3EC6E8; font-size: 14px;")
+        self.map_copy_btn.setEnabled(True)
+
+    def _map_copy_coords(self):
+        """复制 WGS-84 坐标（UOM 申请填表格式：经度,纬度 六位小数）"""
+        wlon, wlat = getattr(self, "_map_wgs", (None, None))
+        if wlon is None:
+            return
+        self._copy_text(f"{wlon:.6f},{wlat:.6f}")
+
+    def _map_locate_ip(self):
+        """IP 粗定位（https://ipinfo.io，免费无需 key）：飞到所在城市"""
+        self.statusBar().showMessage("正在通过 IP 定位……")
+
+        def work():
+            import json as _json
+            import urllib.request as _u
+            with _u.urlopen("https://ipinfo.io/json", timeout=8) as r:
+                loc = _json.loads(r.read().decode())["loc"]
+            return tuple(float(v) for v in loc.split(","))   # lat, lon
+
+        def done(pos):
+            lat, lon = pos
+            # ipinfo 返回 WGS-84 → 转 GCJ-02 落图
+            from apex_map import wgs84_to_gcj02
+            glon, glat = wgs84_to_gcj02(lon, lat)
+            self.map_widget.set_center(glon, glat, 11)
+            self.statusBar().showMessage("已定位到当前城市（IP 粗定位）", 4000)
+
+        self._run_simple_task(work, done, "IP 定位失败：检查网络后重试")
+
+    def _map_sync_uom(self):
+        """同步 UOM 适飞区：实测连通性后如实说明——UOM 空域数据
+        需实名登录，本软件提供官网直达 + 坐标填表工具"""
+        import urllib.request as _u
+        self.statusBar().showMessage("正在连接 UOM 平台……")
+        try:
+            req = _u.Request("https://uom.caac.gov.cn/",
+                             headers={"User-Agent": "Mozilla/5.0"})
+            with _u.urlopen(req, timeout=6):
+                pass
+            reachable = True
+        except Exception:
+            reachable = False
+        msg = QMessageBox(self)
+        msg.setWindowTitle(tr("UOM 适飞区同步"))
+        if reachable:
+            text = ("已连通 UOM 平台（uom.caac.gov.cn）。\n\n"
+                    "按民航局 MH/T 数据接口规范，适飞空域数据需"
+                    "实名账号登录后查询，暂无匿名公开接口，"
+                    "因此无法直接叠加到本地地图。\n\n"
+                    "建议流程：\n"
+                    "① 在本页地图上单击放置起飞点，复制 WGS-84 坐标\n"
+                    "② 打开 UOM 平台登录 → 运行管理 → 空域信息查询\n"
+                    "③ 粘贴坐标查询适飞/管制属性，截图留存")
+        else:
+            text = ("暂时无法连接 UOM 平台（检查网络/代理）。\n\n"
+                    "适飞空域数据需实名登录 uom.caac.gov.cn 查询，"
+                    "本页地图的坐标复制功能不受影响。")
+        msg.setText(text)
+        open_btn = msg.addButton("打开 UOM 平台",
+                                 QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton(QMessageBox.StandardButton.Close)
+        msg.exec()
+        if msg.clickedButton() is open_btn:
+            __import__("webbrowser").open("https://uom.caac.gov.cn/")
+            log_event("已打开 UOM 平台官网")
+
+    def _run_simple_task(self, work, done, err_hint: str):
+        """在后台线程跑无参函数 work()，UI 线程回调 done(result)"""
+        import threading as _th
+
+        def runner():
+            try:
+                result = work()
+            except Exception as e:
+                self._simple_task_err = f"{err_hint}（{e}）"
+                result = None
+            self._simple_task_result = result
+            QTimer.singleShot(0, self._simple_task_finish)
+
+        self._simple_task_done = done
+        _th.Thread(target=runner, daemon=True).start()
+
+    def _simple_task_finish(self):
+        result = getattr(self, "_simple_task_result", None)
+        if result is None:
+            self.statusBar().showMessage(
+                getattr(self, "_simple_task_err", "操作失败"), 6000)
+            return
+        self._simple_task_done(result)
 
     # ---------- 页签 10：应用日志（参考 BF Configurator 日志页） ----------
 
@@ -1142,16 +1309,16 @@ class MainWindow(QMainWindow):
             icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
             brand.addWidget(icon)
         name = QLabel("ApexFlight")
-        name.setStyleSheet("color: #3EC6E8; font-size: 30px; "
+        name.setStyleSheet("color: #3EC6E8; font-size: 34px; "
                            "font-weight: bold;")
         name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand.addWidget(name)
         ver = QLabel(f"v{i18n.APP_VERSION} · GPL-3.0")
-        ver.setStyleSheet("color: #7A828C; font-size: 12px;")
+        ver.setStyleSheet("color: #7A828C; font-size: 13px;")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand.addWidget(ver)
         tag = QLabel(tr("开源 FPV 无人机调参软件"))
-        tag.setStyleSheet("color: #E8E8E8; font-size: 14px;")
+        tag.setStyleSheet("color: #E8E8E8; font-size: 16px;")
         tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand.addWidget(tag)
         sub = QLabel(tr("全本地运行 · 零云端 · 保护飞手隐私"))
@@ -2681,6 +2848,13 @@ class MainWindow(QMainWindow):
 
         # ---- 快捷分析按钮 ----
         quick = QHBoxLayout()
+        self.ai_autotune_btn = QPushButton("🚀 AI 全自动调参")
+        self.ai_autotune_btn.setObjectName("connectBtn")
+        self.ai_autotune_btn.setToolTip(
+            "招牌功能：AI 读取飞控全部数据，直接算出一套新参数，\n"
+            "逐项对比展示哪些加、哪些减，确认后一键写入飞控（自动备份）")
+        self.ai_autotune_btn.clicked.connect(self.on_ai_autotune)
+        quick.addWidget(self.ai_autotune_btn)
         self.ai_advice_btn = QPushButton("🧠 综合调参建议")
         self.ai_advice_btn.setToolTip(
             "把飞控全部数据（PID + Rates + 滤波器 + 黑匣子分析）"
@@ -2886,6 +3060,347 @@ class MainWindow(QMainWindow):
             "跟踪滞后大可以考虑加 FeedForward 或 P。\n\n" + context)
         self._ai_ask(prompt)
 
+    # ---------- v0.93：AI 全自动调参（招牌功能） ----------
+
+    _AUTOTUNE_SYSTEM = (
+        "你是穿越机调参专家。根据用户给出的飞控全部数据，直接计算一套改进的"
+        "调参参数。只输出一个 JSON 对象，不要输出任何其他文字。JSON 结构："
+        '{"pid": [[P,I,D],...], '
+        '"rates": {"rc_rate": [横滚,俯仰,偏航], "expo": [横滚,俯仰,偏航], '
+        '"rate": [横滚,俯仰,偏航], "thr_mid": 数值, "thr_expo": 数值}, '
+        '"filters": {"gyro_lpf1_hz": 数值, "gyro_lpf2_hz": 数值, '
+        '"dterm_lpf1_hz": 数值, "dterm_lpf2_hz": 数值, '
+        '"gyro_dyn_min": 数值, "gyro_dyn_max": 数值, '
+        '"dterm_dyn_min": 数值, "dterm_dyn_max": 数值, '
+        '"notch_min": 数值, "notch_max": 数值, "notch_q": 数值}, '
+        '"explanation": "一两句话说明调整思路"}'
+        "规则：PID 与滤波器必须是整数；Rates 为两位小数；"
+        "pid 数组长度必须和用户给的组数一致；"
+        "只调整有必要调整的项，其余项照抄当前值；"
+        "任何滤波器截止频率不允许为 0；"
+        "P 范围 10~160，I 范围 10~160，D 范围 0~120；"
+        "黑匣子数据显示噪声大就优先降 D、压滤波；跟踪滞后大就适当加 P 或 Rate。")
+
+    def on_ai_autotune(self):
+        """AI 全自动调参：全量数据 → AI 算出参数 → 逐项对比 → 确认写入"""
+        model = self.ai_model_combo.currentText()
+        if not model or model.startswith("（"):
+            self.statusBar().showMessage(
+                "AI 服务未就绪：请先启动 Ollama 并下载模型")
+            return
+        if not self._pid_names:
+            self.statusBar().showMessage(
+                "请先连接飞控读取参数（或选择「虚拟连接」体验该功能）")
+            return
+
+        # 当前值快照（校验 + 对比基准）
+        n_pid = len(self._pid_names)
+        snap = {"pid": [], "rates": None, "filters": None}
+        for row in range(n_pid):
+            vals = []
+            for col in range(3):
+                item = self.pid_table.item(row, col)
+                text = item.text() if item else "0"
+                vals.append(int(text) if text.lstrip("-").isdigit() else 0)
+            snap["pid"].append(vals)
+        if self._rc_raw is not None:
+            p = parse_rc_tuning(bytes(self._rc_raw))
+            snap["rates"] = {
+                "rc_rate": [round(v, 2) for v in p["rc_rate"]],
+                "expo": [round(v, 2) for v in p["expo"]],
+                "rate": [round(v, 2) for v in p["rate"]],
+                "thr_mid": round(p["thr_mid"], 2),
+                "thr_expo": round(p["thr_expo"], 2),
+            }
+        if self._filter_raw is not None:
+            f = parse_filter_config(bytes(self._filter_raw))
+            snap["filters"] = {k: f.get(k, 0)
+                               for k, *_ in FILTER_FIELDS}
+        self._at_snap = snap
+
+        context = self._collect_tuning_context()
+        prompt = ("下面是这台穿越机的全部真实数据，请计算一套改进参数，"
+                  "严格按系统约定的 JSON 结构输出。\n\n" + context)
+        self.ai_autotune_btn.setEnabled(False)
+        self.ai_chat_view.append(
+            "🚀 <b>AI 全自动调参</b>：正在分析全部数据并计算新参数，"
+            "请稍候……")
+        log_event("AI 全自动调参：开始分析")
+
+        import threading as _th
+
+        def runner():
+            try:
+                text = chat_blocking(model, [
+                    {"role": "system", "content": self._AUTOTUNE_SYSTEM},
+                    {"role": "user", "content": prompt}], json_mode=True)
+                self._at_result = ("ok", text)
+            except Exception as e:
+                self._at_result = ("err", str(e))
+            QTimer.singleShot(0, self._autotune_finish)
+
+        _th.Thread(target=runner, daemon=True).start()
+
+    def _autotune_finish(self):
+        """AI 回答到达（界面线程）：解析 → 校验 → 弹对比对话框"""
+        self.ai_autotune_btn.setEnabled(True)
+        tag, payload = self._at_result
+        if tag == "err":
+            self.ai_chat_view.append(f"❌ AI 调用失败：{payload}")
+            log_event(f"AI 全自动调参失败：{payload}")
+            return
+        try:
+            data = extract_json(payload)
+        except Exception:
+            self.ai_chat_view.append(
+                "⚠️ AI 回答不是有效 JSON，原文如下：\n" + payload)
+            return
+        changes, notes = self._validate_autotune(data, self._at_snap)
+        explanation = str(data.get("explanation", "")).strip()
+        if not changes:
+            self.ai_chat_view.append(
+                "🤖 AI 认为当前参数已经比较合适，无需改动。\n" + explanation)
+            return
+        self._show_autotune_dialog(changes, explanation, notes)
+
+    def _validate_autotune(self, data: dict, snap: dict):
+        """校验并钳制 AI 给出的参数，生成变化清单。
+
+        返回 (changes, notes)。changes 元素：
+        {"kind": "pid"/"rate"/"filter", "key": ..., "label": 中文名,
+         "old": 当前值, "new": 建议值}
+        """
+        changes, notes = [], []
+
+        def clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        # ---- PID ----
+        ai_pid = data.get("pid")
+        if isinstance(ai_pid, list) and len(ai_pid) == len(snap["pid"]):
+            names = ("P", "I", "D")
+            bounds = ((10, 160), (10, 160), (0, 120))
+            for row, (cur, new) in enumerate(zip(snap["pid"], ai_pid)):
+                if not isinstance(new, (list, tuple)) or len(new) < 3:
+                    notes.append(f"第 {row + 1} 组 PID 格式异常，已跳过")
+                    continue
+                for col in range(3):
+                    try:
+                        v = int(round(float(new[col])))
+                    except (TypeError, ValueError):
+                        continue
+                    v = clamp(v, *bounds[col])
+                    if v != cur[col]:
+                        changes.append({
+                            "kind": "pid", "key": (row, col),
+                            "label": f"{self._pid_names[row]} {names[col]}",
+                            "old": cur[col], "new": v})
+        elif ai_pid is not None:
+            notes.append("AI 返回的 PID 组数与当前飞控不一致，PID 部分已忽略")
+
+        # ---- Rates ----
+        ai_rates = data.get("rates")
+        if snap["rates"] and isinstance(ai_rates, dict):
+            cur = snap["rates"]
+            field_names = {"rc_rate": "RC Rate", "expo": "Expo",
+                           "rate": "Rate"}
+            axes = ("横滚", "俯仰", "偏航")
+            for field, label in field_names.items():
+                vals = ai_rates.get(field)
+                if not isinstance(vals, (list, tuple)) or len(vals) < 3:
+                    continue
+                for axis in range(3):
+                    try:
+                        v = round(float(vals[axis]), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    v = clamp(v, 0.0, 2.55)
+                    if abs(v - cur[field][axis]) >= 0.01:
+                        changes.append({
+                            "kind": "rate", "key": (field, axis),
+                            "label": f"{label} {axes[axis]}",
+                            "old": cur[field][axis], "new": v})
+            for field, label, lo, hi in (
+                    ("thr_mid", "油门中点", 0.2, 0.8),
+                    ("thr_expo", "油门 Expo", 0.0, 1.0)):
+                try:
+                    v = round(float(ai_rates.get(field)), 2)
+                except (TypeError, ValueError):
+                    continue
+                v = clamp(v, lo, hi)
+                if abs(v - cur[field]) >= 0.01:
+                    changes.append({"kind": "rate", "key": (field, -1),
+                                    "label": label,
+                                    "old": cur[field], "new": v})
+
+        # ---- 滤波器 ----
+        ai_filters = data.get("filters")
+        if snap["filters"] and isinstance(ai_filters, dict):
+            bounds = {k: (lo, hi) for k, _n, _o, _t, lo, hi in FILTER_FIELDS}
+            names = {k: n for k, n, _o, _t, _l, _h in FILTER_FIELDS}
+            for key, cur_v in snap["filters"].items():
+                if key not in ai_filters:
+                    continue
+                try:
+                    v = int(round(float(ai_filters[key])))
+                except (TypeError, ValueError):
+                    continue
+                lo, hi = bounds.get(key, (0, 65535))
+                v = clamp(v, lo, hi)
+                # 安全红线：AI 不允许把低通/动态滤波压到 40Hz 以下
+                # （等于关掉滤波，可能烧电机）——越界直接保持原值
+                if ("lpf" in key or "dyn" in key) and 0 < v < 40 \
+                        and cur_v >= 40:
+                    notes.append(
+                        f"AI 建议把{names.get(key, key)}压到 {v}Hz，"
+                        f"过于激进已保持原值 {cur_v}Hz")
+                    continue
+                if v == 0 and cur_v != 0:
+                    notes.append(
+                        f"AI 建议关闭{names.get(key, key)}，已拒绝"
+                        f"（关闭滤波有烧电机风险）")
+                    continue
+                if v != cur_v:
+                    changes.append({"kind": "filter", "key": key,
+                                    "label": names.get(key, key),
+                                    "old": cur_v, "new": v})
+        return changes, notes
+
+    def _show_autotune_dialog(self, changes: list, explanation: str,
+                              notes: list):
+        """AI 全自动调参对比对话框：哪些加了、哪些减了，一目了然"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🚀 AI 全自动调参 · 方案对比")
+        dlg.setMinimumWidth(640)
+        lay = QVBoxLayout(dlg)
+
+        if explanation:
+            head = QLabel("🤖 " + explanation)
+            head.setWordWrap(True)
+            head.setStyleSheet("color: #3EC6E8; font-size: 14px; "
+                               "padding-bottom: 4px;")
+            lay.addWidget(head)
+
+        table = QTableWidget(len(changes), 4)
+        table.setHorizontalHeaderLabels(
+            [tr("参数"), tr("当前值"), tr("建议值"), tr("变化")])
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        up = down = 0
+        for i, ch in enumerate(changes):
+            delta = ch["new"] - ch["old"]
+            if delta > 0:
+                up += 1
+                arrow, color = "↑", "#4CAF50"
+                sign = f"+{delta:g}"
+            else:
+                down += 1
+                arrow, color = "↓", "#E04545"
+                sign = f"{delta:g}"
+            table.setItem(i, 0, QTableWidgetItem(ch["label"]))
+            table.setItem(i, 1, QTableWidgetItem(f"{ch['old']:g}"))
+            new_item = QTableWidgetItem(f"{ch['new']:g}")
+            new_item.setForeground(QColor(color))
+            table.setItem(i, 2, new_item)
+            d_item = QTableWidgetItem(f"{arrow} {sign}")
+            d_item.setForeground(QColor(color))
+            font = d_item.font()
+            font.setBold(True)
+            d_item.setFont(font)
+            table.setItem(i, 3, d_item)
+        table.setMinimumHeight(min(360, 40 + 30 * len(changes)))
+        lay.addWidget(table)
+
+        summary = QLabel(
+            f"共 {len(changes)} 项调整："
+            f"<span style='color:#4CAF50'>↑ 增大 {up} 项</span>　"
+            f"<span style='color:#E04545'>↓ 减小 {down} 项</span>")
+        summary.setStyleSheet("font-size: 14px;")
+        lay.addWidget(summary)
+        if notes:
+            note_lab = QLabel("⚠️ " + "\n⚠️ ".join(notes))
+            note_lab.setWordWrap(True)
+            note_lab.setStyleSheet("color: #E0A545;")
+            lay.addWidget(note_lab)
+
+        btns = QHBoxLayout()
+        tip = QLabel("写入前会自动备份当前全部参数，可随时恢复")
+        tip.setStyleSheet("color: #9AA0A6;")
+        btns.addWidget(tip, 1)
+        apply_btn = QPushButton("✅ 应用方案（写入飞控）")
+        apply_btn.setObjectName("connectBtn")
+        cancel_btn = QPushButton("❌ 取消")
+        btns.addWidget(apply_btn)
+        btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+
+        cancel_btn.clicked.connect(dlg.reject)
+
+        def apply_and_close():
+            self._apply_autotune(changes)
+            dlg.accept()
+
+        apply_btn.clicked.connect(apply_and_close)
+        dlg.exec()
+
+    def _apply_autotune(self, changes: list):
+        """把 AI 方案落到 UI 状态并写入飞控（自动备份 + 写后读回校验）"""
+        # 1) PID → 表格
+        for ch in changes:
+            if ch["kind"] == "pid":
+                row, col = ch["key"]
+                self.pid_table.setItem(
+                    row, col, QTableWidgetItem(str(ch["new"])))
+        # 2) Rates → 原始字节（read-modify-write）
+        if self._rc_raw is not None:
+            for ch in changes:
+                if ch["kind"] != "rate":
+                    continue
+                field, axis = ch["key"]
+                if axis >= 0:
+                    set_rc_value(self._rc_raw, field, axis, ch["new"])
+                elif field == "thr_mid":
+                    self._rc_raw[6] = max(0, min(255,
+                                                 round(ch["new"] * 100)))
+                elif field == "thr_expo":
+                    self._rc_raw[7] = max(0, min(255,
+                                                 round(ch["new"] * 100)))
+        # 3) 滤波器 → 原始字节
+        if self._filter_raw is not None:
+            for ch in changes:
+                if ch["kind"] == "filter":
+                    set_filter_value(self._filter_raw, ch["key"],
+                                     int(ch["new"]))
+        # 刷新 Rates/滤波页控件显示
+        if self._rc_raw is not None and self._filter_raw is not None:
+            self.on_tuning_ready({"rc_raw": list(self._rc_raw),
+                                  "filter_raw": list(self._filter_raw)})
+        # 4) 一个后台线程顺序写入（各自内置备份与读回校验）
+        pid_values = []
+        for row in range(len(self._pid_names)):
+            vals = []
+            for col in range(3):
+                item = self.pid_table.item(row, col)
+                vals.append(int(item.text()) if item else 0)
+            pid_values.append(tuple(vals))
+        log_event(f"AI 全自动调参：应用 {len(changes)} 项调整，开始写入")
+        self.ai_chat_view.append(
+            f"✅ 正在把 AI 方案写入飞控（{len(changes)} 项调整，"
+            f"已自动备份）……")
+        self._run_in_thread(self._autotune_write_all,
+                            pid_values,
+                            list(self._rc_raw) if self._rc_raw else None,
+                            list(self._filter_raw)
+                            if self._filter_raw else None)
+
+    def _autotune_write_all(self, pid_values, rc_raw, filter_raw):
+        """后台线程：先写 PID、再写 Rates/滤波（顺序执行，串口不打架）"""
+        self.worker.write_pids(self._pid_names, pid_values, True)
+        if rc_raw is not None and filter_raw is not None:
+            self.worker.write_tuning(rc_raw, filter_raw)
+
     def _ai_ask(self, user_text: str):
         """发起一轮 AI 对话（统一入口）"""
         if self._ai_busy:
@@ -2985,18 +3500,21 @@ class MainWindow(QMainWindow):
     # ---------- 串口扫描与连接 ----------
 
     def refresh_ports(self):
-        """扫描并列出所有可用串口"""
+        """扫描并列出所有可用串口（v0.93：固定附带虚拟连接入口）"""
         self.statusBar().showMessage("正在扫描串口……")
         self.port_combo.clear()
         ports = list(list_ports.comports())
-        if not ports:
-            self.port_combo.addItem("（未检测到串口，请插入飞控）", None)
-            self.statusBar().showMessage(
-                "未检测到串口：请插入飞控 USB 线后点击「刷新」")
-            return
         for p in ports:
             self.port_combo.addItem(f"{p.device} - {p.description}", p.device)
-        self.statusBar().showMessage(f"扫描完成：发现 {len(ports)} 个串口")
+        # 虚拟连接（参考 BF 虚拟模式）：不插飞控也能体验全部界面
+        self.port_combo.addItem(tr(VIRTUAL_PORT_LABEL), VIRTUAL_PORT)
+        if not ports:
+            self.port_combo.setCurrentIndex(self.port_combo.count() - 1)
+            self.statusBar().showMessage(
+                "未检测到串口：可插入飞控后点「刷新」，或选择虚拟连接体验")
+            return
+        self.statusBar().showMessage(
+            f"扫描完成：发现 {len(ports)} 个串口（另含虚拟连接）")
 
     def on_connect_clicked(self):
         port = self.port_combo.currentData()
@@ -3006,8 +3524,12 @@ class MainWindow(QMainWindow):
         baudrate = int(self.baud_combo.currentText())
         self.connect_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
-        self.statusBar().showMessage(f"正在连接 {port} @ {baudrate}……")
-        log_event(f"正在连接 {port} @ {baudrate}")
+        if port == VIRTUAL_PORT:
+            self.statusBar().showMessage("正在连接虚拟飞控（演示模式）……")
+            log_event("正在连接虚拟飞控（演示模式）")
+        else:
+            self.statusBar().showMessage(f"正在连接 {port} @ {baudrate}……")
+            log_event(f"正在连接 {port} @ {baudrate}")
         self._run_in_thread(self.worker.connect_and_query, port, baudrate)
 
     def on_disconnect_clicked(self):
@@ -3049,7 +3571,12 @@ class MainWindow(QMainWindow):
 
     def on_connected(self, info: dict):
         self.firmware_label.setText(info.get("firmware", "未知"))
-        self.board_label.setText(info.get("board", "未知"))
+        board_text = info.get("board", "未知")
+        if isinstance(self.worker.serial_port, VirtualSerial):
+            board_text += "（演示模式）"          # v0.93：虚拟连接标识
+            self.statusBar().showMessage(
+                "虚拟模式：数据为仿真，写入不会触碰真实飞控", 6000)
+        self.board_label.setText(board_text)
         self.motors_label.setText(info.get("motors", "未知"))
         log_event(f"已连接：{info.get('firmware', '未知')} / "
                   f"{info.get('board', '未知')}")

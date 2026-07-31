@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.92"
+APP_VERSION = "0.93"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -79,6 +79,19 @@ _EN = {
         "Open source (GPL-3.0) - stars, issues and PRs are welcome",
     "打开 GitHub 仓库": "Open GitHub repo",
     "已复制到剪贴板": "Copied to clipboard",
+    # ---- 虚拟连接 / 适飞地图（v0.93）----
+    "虚拟连接（无飞控体验全部功能）": "Virtual FC (try all features, no hardware)",
+    "适飞地图": "Fly Zones",
+    "底图：": "Base map:",
+    "放大": "Zoom in", "缩小": "Zoom out",
+    "定位我的城市": "Locate my city",
+    "同步 UOM 适飞区": "Sync UOM fly zones",
+    "UOM 适飞区同步": "UOM fly-zone sync",
+    "单击地图放置起飞点标记，坐标供 UOM 空域申请填表使用":
+        "Click the map to drop a takeoff marker; coordinates ready for UOM airspace forms",
+    "复制坐标": "Copy coordinates",
+    "参数": "Parameter", "当前值": "Current",
+    "建议值": "Suggested", "变化": "Change",
     "语言已切换：界面已立即生效（状态栏等动态提示保持中文）。":
         "Language switched. (Dynamic status messages remain in Chinese.)",
     # ---- 日志页 ----

@@ -41,6 +41,34 @@ def ollama_status() -> tuple[bool, list]:
         return False, []
 
 
+def chat_blocking(model: str, messages: list, timeout: int = 180,
+                  json_mode: bool = False) -> str:
+    """非流式对话（必须在后台线程调用），返回完整回答文本。
+
+    json_mode=True 时使用 Ollama 的 format=json 强制合法 JSON 输出，
+    用于 AI 全自动调参这类需要结构化结果的场景（v0.93）。
+    """
+    body_dict = {"model": model, "messages": messages, "stream": False}
+    if json_mode:
+        body_dict["format"] = "json"
+    body = json.dumps(body_dict).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_BASE_URL + "/api/chat", data=body,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get("message", {}).get("content", "")
+
+
+def extract_json(text: str) -> dict:
+    """从 AI 回答里稳健地提取第一个 JSON 对象（允许前后带解释文字）"""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("回答中没有 JSON 对象")
+    return json.loads(text[start:end + 1])
+
+
 class AIBridge(QObject):
     """AI 对话桥：在后台线程调用 Ollama，流式输出通过信号送回界面"""
 

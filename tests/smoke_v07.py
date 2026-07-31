@@ -64,7 +64,7 @@ check("单日志绘图正常", True)
 
 # 5. 渲染全部页面截图
 n_pages = win.pages.count() if hasattr(win, "pages") else 0
-check("存在 11 个页面", n_pages == 11, f"实际 {n_pages}")
+check("存在 12 个页面", n_pages == 12, f"实际 {n_pages}")
 for i in range(n_pages):
     try:
         if hasattr(win, "sidebar"):
