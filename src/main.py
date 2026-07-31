@@ -75,6 +75,40 @@ from apex_fc import *        # noqa: F401,F403  飞控查询/写入/备份/快�
 from apex_blackbox import *  # noqa: F401,F403  黑匣子分析
 from apex_ai import *        # noqa: F401,F403  AI 助手
 from apex_widgets import *   # noqa: F401,F403  自定义控件
+import apex_i18n as i18n     # 版本号 / 配置 / 多语言
+from apex_i18n import tr     # 界面翻译
+
+
+# ------------------------------------------------------------
+# 应用日志（v0.9）：会话内事件记录，参考 BF Configurator 的日志页
+# 同时写入 logs/app.log（超 1MB 自动轮转为 app.log.1）
+# ------------------------------------------------------------
+
+class _AppLogger(QObject):
+    """日志总线：后台线程 emit 信号，界面线程安全接收"""
+    appended = pyqtSignal(str)
+
+
+app_logger = _AppLogger()
+_app_log_lock = threading.Lock()
+_app_log_lines: list = []                     # 本次会话的全部日志行
+
+
+def log_event(message: str):
+    """记录一条应用日志（线程安全）：存内存缓冲 + 追加到 logs/app.log + 通知界面"""
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {message}"
+    with _app_log_lock:
+        _app_log_lines.append(line)
+        try:
+            LOGS_DIR.mkdir(exist_ok=True)
+            log_file = LOGS_DIR / "app.log"
+            if log_file.exists() and log_file.stat().st_size > 1024 * 1024:
+                log_file.replace(LOGS_DIR / "app.log.1")   # 轮转，保留上一份
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+    app_logger.appended.emit(line)
 
 # ============================================================
 # 第五部分：后台工作线程（防止界面卡死）
@@ -505,8 +539,13 @@ class MainWindow(QMainWindow):
         self._motor_sliders = []              # 电机滑块列表
         self._motor_count = 0
         self._rc_bars = []                    # RC 通道显示条
+        self._compat = None                   # 兼容性评估结果（连接后设置）
 
-        self.setWindowTitle("ApexFlight")
+        # 用户配置（语言 / 默认波特率），启动时加载并应用
+        self._cfg = i18n.load_config()
+        i18n.init_from_config(self._cfg)
+
+        self.setWindowTitle(f"{i18n.APP_NAME} v{i18n.APP_VERSION}")
         self.resize(960, 680)
         self._center_on_screen()
         if ICON_PATH.exists():
@@ -748,30 +787,41 @@ class MainWindow(QMainWindow):
         title = QLabel("ApexFlight")
         title.setObjectName("titleLabel")
         top.addWidget(title)
+        version_label = QLabel(f"v{i18n.APP_VERSION}")
+        version_label.setObjectName("versionLabel")
+        version_label.setStyleSheet("color: #7A828C; font-size: 13px; "
+                                    "padding-top: 4px;")
+        self._version_label = version_label
+        top.addWidget(version_label)
         top.addStretch()
 
-        top.addWidget(QLabel("串口"))
+        self.lbl_port = QLabel(tr("串口"))
+        top.addWidget(self.lbl_port)
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(210)
         top.addWidget(self.port_combo)
-        self.refresh_button = QPushButton("刷新")
+        self.refresh_button = QPushButton(tr("刷新"))
         self.refresh_button.clicked.connect(self.refresh_ports)
         top.addWidget(self.refresh_button)
-        top.addWidget(QLabel("波特率"))
+        self.lbl_baud = QLabel(tr("波特率"))
+        top.addWidget(self.lbl_baud)
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["57600", "115200", "230400", "460800"])
-        self.baud_combo.setCurrentText("115200")
+        self.baud_combo.setCurrentText(self._cfg.get("baud", "115200"))
         top.addWidget(self.baud_combo)
-        self.connect_button = QPushButton("连接")
+        self.connect_button = QPushButton(tr("连接"))
         self.connect_button.setObjectName("connectBtn")
         self.connect_button.setMinimumWidth(90)
         self.connect_button.clicked.connect(self.on_connect_clicked)
         top.addWidget(self.connect_button)
-        self.disconnect_button = QPushButton("断开")
+        self.disconnect_button = QPushButton(tr("断开"))
         self.disconnect_button.setObjectName("disconnectBtn")
         self.disconnect_button.setEnabled(False)
         self.disconnect_button.clicked.connect(self.on_disconnect_clicked)
         top.addWidget(self.disconnect_button)
+        self.settings_button = QPushButton("⚙ " + tr("设置"))
+        self.settings_button.clicked.connect(self.open_settings)
+        top.addWidget(self.settings_button)
         layout.addWidget(topbar)
 
         # ---- 主体：左侧导航 + 右侧页面堆栈 ----
@@ -784,9 +834,15 @@ class MainWindow(QMainWindow):
         self.sidebar.setFixedWidth(150)
         self.sidebar.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # 隐藏横向滚动条
-        self.sidebar.addItems(["📊  仪表盘", "🎛️  PID 调参", "🎯  Rates 调参",
-                               "🌊  滤波器", "⚙️  电机测试", "📡  接收机",
-                               "📈  黑匣子", "💾  调参方案", "🤖  AI 助手"])
+        # 侧栏条目 = 图标 + 名称键（名称键用于 i18n 翻译）
+        self._sidebar_entries = [
+            ("📊", "仪表盘"), ("🎛️", "PID 调参"), ("🎯", "Rates 调参"),
+            ("🌊", "滤波器"), ("⚙️", "电机测试"), ("📡", "接收机"),
+            ("📈", "黑匣子"), ("💾", "调参方案"), ("🤖", "AI 助手"),
+            ("📜", "日志"),
+        ]
+        self.sidebar.addItems([f"{ic}  {tr(name)}"
+                               for ic, name in self._sidebar_entries])
         self.sidebar.setCurrentRow(0)
         body.addWidget(self.sidebar)
 
@@ -800,6 +856,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._build_blackbox_tab())
         self.pages.addWidget(self._build_preset_tab())
         self.pages.addWidget(self._build_ai_tab())
+        self.pages.addWidget(self._build_log_tab())
         body.addWidget(self.pages, 1)
 
         body_widget = QWidget()
@@ -809,7 +866,149 @@ class MainWindow(QMainWindow):
         # 导航点击切换页面
         self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
 
-        self.statusBar().showMessage("就绪：请选择串口后点击「连接」")
+        # 应用日志总线 → 日志页
+        app_logger.appended.connect(self._on_app_log)
+        log_event(f"ApexFlight v{i18n.APP_VERSION} 已启动")
+
+        self.statusBar().showMessage(tr("就绪：请选择串口后点击「连接」"))
+
+    # ---------- 页签 10：应用日志（参考 BF Configurator 日志页） ----------
+
+    def _build_log_tab(self) -> QWidget:
+        """应用日志页：连接/写入/下载/错误等事件实时滚动显示，
+        随时可回看，可清空、另存、打开日志文件夹"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 9))
+        with _app_log_lock:
+            history = list(_app_log_lines)
+        self.log_view.setPlainText(
+            "\n".join(history) if history else tr("（暂无日志）"))
+        layout.addWidget(self.log_view, 1)
+
+        btn_row = QHBoxLayout()
+        self.log_clear_btn = QPushButton(tr("清空"))
+        self.log_clear_btn.clicked.connect(self._on_log_clear)
+        btn_row.addWidget(self.log_clear_btn)
+        self.log_save_btn = QPushButton(tr("另存为…"))
+        self.log_save_btn.clicked.connect(self._on_log_save)
+        btn_row.addWidget(self.log_save_btn)
+        self.log_open_btn = QPushButton(tr("打开日志文件夹"))
+        self.log_open_btn.clicked.connect(self._open_log_folder)
+        btn_row.addWidget(self.log_open_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        return tab
+
+    def _on_app_log(self, line: str):
+        """日志总线信号：追加到日志页（启动提示占位行先清掉）"""
+        if self.log_view.toPlainText() == tr("（暂无日志）"):
+            self.log_view.clear()
+        self.log_view.append(line)
+
+    def _on_log_clear(self):
+        with _app_log_lock:
+            _app_log_lines.clear()
+        self.log_view.clear()
+        log_event("日志已清空")
+
+    def _on_log_save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("另存为…"), f"apexflight_log_"
+            f"{datetime.now():%Y%m%d_%H%M%S}.txt",
+            "日志文件 (*.txt)")
+        if not path:
+            return
+        try:
+            with _app_log_lock:
+                content = "\n".join(_app_log_lines)
+            Path(path).write_text(content, encoding="utf-8")
+            self.statusBar().showMessage(f"日志已保存：{path}")
+        except Exception as e:
+            QMessageBox.warning(self, i18n.APP_NAME, f"保存失败：{e}")
+
+    def _open_log_folder(self):
+        """用系统文件管理器打开 logs/ 目录（app.log / crash.log / 黑匣子）"""
+        LOGS_DIR.mkdir(exist_ok=True)
+        import os
+        os.startfile(str(LOGS_DIR))
+
+    # ---------- 设置对话框（参考 BF Configurator 设置） ----------
+
+    def open_settings(self):
+        """设置：语言、默认波特率、日志入口、关于信息"""
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("⚙ " + tr("设置"))
+        dlg.setMinimumWidth(380)
+        form = QFormLayout(dlg)
+
+        lang_combo = QComboBox()
+        lang_combo.addItem("简体中文", "zh")
+        lang_combo.addItem("English", "en")
+        lang_combo.setCurrentIndex(0 if i18n.get_language() == "zh" else 1)
+        form.addRow(tr("语言") + "：", lang_combo)
+
+        baud_combo = QComboBox()
+        baud_combo.addItems(["57600", "115200", "230400", "460800"])
+        baud_combo.setCurrentText(self._cfg.get("baud", "115200"))
+        form.addRow(tr("默认波特率") + "：", baud_combo)
+
+        log_btn = QPushButton(tr("打开日志文件夹"))
+        log_btn.clicked.connect(self._open_log_folder)
+        form.addRow(tr("日志") + "：", log_btn)
+
+        about = QLabel(
+            f"{i18n.APP_NAME} v{i18n.APP_VERSION} · GPL-3.0<br>"
+            "github.com/mingwx1204/ApexFlight")
+        about.setStyleSheet("color: #7A828C;")
+        form.addRow(tr("关于") + "：", about)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # 应用设置并持久化到 config.json
+        old_lang = i18n.get_language()
+        self._cfg["language"] = lang_combo.currentData()
+        self._cfg["baud"] = baud_combo.currentText()
+        i18n.save_config(self._cfg)
+        self.baud_combo.setCurrentText(self._cfg["baud"])
+        i18n.set_language(self._cfg["language"])
+        self.retranslate_ui()
+        if i18n.get_language() != old_lang:
+            self.statusBar().showMessage(tr(
+                "语言已切换：导航与顶栏立即生效，其余界面重启后完全生效。"))
+        log_event(f"设置已保存（语言={self._cfg['language']}，"
+                  f"默认波特率={self._cfg['baud']}）")
+
+    def retranslate_ui(self):
+        """语言切换后刷新：窗口标题、侧栏、顶栏、日志页按钮"""
+        self.setWindowTitle(f"{i18n.APP_NAME} v{i18n.APP_VERSION}")
+        row = self.sidebar.currentRow()
+        for i, (icon, name) in enumerate(self._sidebar_entries):
+            item = self.sidebar.item(i)
+            if item:
+                item.setText(f"{icon}  {tr(name)}")
+        self.sidebar.setCurrentRow(row)
+        self.lbl_port.setText(tr("串口"))
+        self.lbl_baud.setText(tr("波特率"))
+        self.refresh_button.setText(tr("刷新"))
+        self.connect_button.setText(tr("连接"))
+        self.disconnect_button.setText(tr("断开"))
+        self.settings_button.setText("⚙ " + tr("设置"))
+        self.log_clear_btn.setText(tr("清空"))
+        self.log_save_btn.setText(tr("另存为…"))
+        self.log_open_btn.setText(tr("打开日志文件夹"))
 
     # ---------- 页签 1：仪表盘 ----------
 
@@ -1195,6 +1394,7 @@ class MainWindow(QMainWindow):
             return
         self._flash_cancel = threading.Event()
         self.bb_flash_btn.setText("⏹ 取消下载")
+        log_event("开始从飞控下载黑匣子数据")
         # 下载期间暂停姿态/状态轮询：
         # 轮询线程会和下载线程抢同一把串口锁，拖慢下载速度
         self.fast_timer.stop()
@@ -1215,6 +1415,7 @@ class MainWindow(QMainWindow):
         self.bb_flash_btn.setText("📥 从飞控下载")
         self._flash_cancel = None
         self._resume_polling_after_flash()
+        log_event(f"黑匣子下载完成：{path_str}")
         try:
             path = Path(path_str)
             self.statusBar().showMessage("下载完成，正在解码……")
@@ -2571,6 +2772,7 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.statusBar().showMessage(f"正在连接 {port} @ {baudrate}……")
+        log_event(f"正在连接 {port} @ {baudrate}")
         self._run_in_thread(self.worker.connect_and_query, port, baudrate)
 
     def on_disconnect_clicked(self):
@@ -2581,6 +2783,7 @@ class MainWindow(QMainWindow):
         self.worker.close_port()
         self._set_disconnected_ui()
         self.statusBar().showMessage("已断开连接，串口已释放")
+        log_event("已断开连接")
 
     # ---------- 实时轮询 ----------
 
@@ -2613,6 +2816,8 @@ class MainWindow(QMainWindow):
         self.firmware_label.setText(info.get("firmware", "未知"))
         self.board_label.setText(info.get("board", "未知"))
         self.motors_label.setText(info.get("motors", "未知"))
+        log_event(f"已连接：{info.get('firmware', '未知')} / "
+                  f"{info.get('board', '未知')}")
         self.disconnect_button.setEnabled(True)
         for btn in (self.pid_reload_btn, self.pid_write_btn,
                     self.pid_backup_btn, self.pid_restore_btn,
@@ -2702,6 +2907,7 @@ class MainWindow(QMainWindow):
     def on_write_done(self, message: str):
         self.statusBar().showMessage(message.splitlines()[0])
         self.refresh_preset_list()            # 保存预设后刷新列表
+        log_event(message.splitlines()[0])
         QMessageBox.information(self, "ApexFlight", message)
 
     def on_motor_count(self, count: int):
@@ -2733,6 +2939,7 @@ class MainWindow(QMainWindow):
             self.bb_flash_btn.setText("📥 从飞控下载")
             self._resume_polling_after_flash()
         self.statusBar().showMessage(f"错误：{message.splitlines()[0]}")
+        log_event(f"错误：{message.splitlines()[0]}")
         self.connect_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
 

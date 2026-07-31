@@ -64,7 +64,7 @@ check("单日志绘图正常", True)
 
 # 5. 渲染全部页面截图
 n_pages = win.pages.count() if hasattr(win, "pages") else 0
-check("存在 9 个页面", n_pages == 9, f"实际 {n_pages}")
+check("存在 10 个页面", n_pages == 10, f"实际 {n_pages}")
 for i in range(n_pages):
     try:
         if hasattr(win, "sidebar"):
@@ -101,6 +101,36 @@ win.on_connected({"firmware": "Betaflight 4.5.2", "board": "TEST",
                   "variant": "BTFL", "version_tuple": (4, 5, 2)})
 app.processEvents()
 check("BF 4.5 接入无兼容提示", not win.compat_label.isVisible())
+
+# 9. v0.9：版本号显示
+import apex_i18n as i18n
+check("窗口标题含版本号", i18n.APP_VERSION in win.windowTitle(),
+      win.windowTitle())
+check("顶栏版本标签", win._version_label.text() == f"v{i18n.APP_VERSION}")
+
+# 10. v0.9：日志页收到事件
+m.log_event("冒烟测试日志事件")
+app.processEvents()
+check("日志页显示事件", "冒烟测试日志事件" in win.log_view.toPlainText())
+
+# 11. v0.9：语言切换到英文再切回
+i18n.set_language("en")
+win.retranslate_ui()
+app.processEvents()
+item0 = win.sidebar.item(0).text()
+check("英文侧栏", "Dashboard" in item0, item0)
+check("英文顶栏按钮", win.connect_button.text() == "Connect")
+i18n.set_language("zh")
+win.retranslate_ui()
+app.processEvents()
+check("切回中文侧栏", "仪表盘" in win.sidebar.item(0).text())
+check("切回中文按钮", win.connect_button.text() == "连接")
+
+# 12. v0.9：配置保存/读取往返
+cfg = i18n.load_config()
+cfg["language"] = "zh"
+i18n.save_config(cfg)
+check("config.json 存在", i18n.CONFIG_PATH.exists())
 
 win.close()
 print(f"\n{'全部通过' if failed == 0 else str(failed) + ' 项失败'}")
