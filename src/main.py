@@ -631,6 +631,8 @@ class MainWindow(QMainWindow):
             }
             QListWidget#sidebar::item {
                 padding: 15px 14px;
+                margin: 3px 6px;
+                border-radius: 9px;
                 color: #9AA0A6;
                 border-left: 3px solid transparent;
             }
@@ -643,7 +645,7 @@ class MainWindow(QMainWindow):
             /* 分组框 */
             QGroupBox {
                 border: 1px solid #363C44;
-                border-radius: 8px;
+                border-radius: 12px;
                 margin-top: 14px;
                 padding-top: 12px;
                 background: #23272E;
@@ -659,7 +661,7 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: #2E333B;
                 border: 1px solid #454C55;
-                border-radius: 6px;
+                border-radius: 10px;
                 padding: 8px 16px;
                 color: #E8E8E8;
             }
@@ -693,7 +695,7 @@ class MainWindow(QMainWindow):
             QComboBox {
                 background: #2E333B;
                 border: 1px solid #454C55;
-                border-radius: 6px;
+                border-radius: 10px;
                 padding: 7px 10px;
             }
             QComboBox:hover { border-color: #3EC6E8; }
@@ -707,7 +709,7 @@ class MainWindow(QMainWindow):
                 background: #1F2329;
                 gridline-color: #363C44;
                 border: 1px solid #363C44;
-                border-radius: 6px;
+                border-radius: 10px;
             }
             QHeaderView::section {
                 background: #2E333B;
@@ -723,24 +725,32 @@ class MainWindow(QMainWindow):
             QLineEdit {
                 background: #2E333B;
                 border: 1px solid #3EC6E8;
-                border-radius: 4px;
-                padding: 2px 4px;
+                border-radius: 8px;
+                padding: 6px 8px;
             }
+            /* 文本编辑区 / 数字输入框（v0.95：统一圆角） */
+            QTextEdit, QSpinBox, QDoubleSpinBox {
+                background: #1F2329;
+                border: 1px solid #363C44;
+                border-radius: 10px;
+                padding: 4px 6px;
+            }
+            QSpinBox, QDoubleSpinBox { padding-right: 4px; }
             /* 滑块 */
             QSlider::groove:horizontal {
-                height: 6px;
+                height: 8px;
                 background: #363C44;
-                border-radius: 3px;
+                border-radius: 4px;
             }
             QSlider::sub-page:horizontal {
                 background: #3EC6E8;
-                border-radius: 3px;
+                border-radius: 4px;
             }
             QSlider::handle:horizontal {
-                width: 16px;
-                height: 16px;
-                margin: -6px 0;
-                border-radius: 8px;
+                width: 20px;
+                height: 20px;
+                margin: -7px 0;
+                border-radius: 10px;
                 background: #3EC6E8;
             }
             QSlider::handle:horizontal:disabled { background: #5A6068; }
@@ -748,10 +758,10 @@ class MainWindow(QMainWindow):
             /* 复选框 */
             QCheckBox { spacing: 6px; }
             QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
+                width: 18px;
+                height: 18px;
                 border: 1px solid #454C55;
-                border-radius: 3px;
+                border-radius: 5px;
                 background: #2E333B;
             }
             QCheckBox::indicator:checked {
@@ -999,23 +1009,44 @@ class MainWindow(QMainWindow):
         self._copy_text(f"{wlon:.6f},{wlat:.6f}")
 
     def _map_locate_ip(self):
-        """IP 粗定位（https://ipinfo.io，免费无需 key）：飞到所在城市"""
+        """IP 粗定位：双数据源（ip-api 中文城市名优先，ipinfo 兜底），
+        定位后放置起飞点标记并如实提示精度"""
         self.statusBar().showMessage("正在通过 IP 定位……")
 
         def work():
             import json as _json
             import urllib.request as _u
+            # 首选 ip-api.com：返回中文城市名，国内运营商数据较全
+            try:
+                with _u.urlopen(
+                        "http://ip-api.com/json/?lang=zh-CN&fields"
+                        "=status,country,regionName,city,lat,lon",
+                        timeout=8) as r:
+                    d = _json.loads(r.read().decode())
+                if d.get("status") == "success":
+                    city = d.get("city") or d.get("regionName") or ""
+                    return d["lat"], d["lon"], city
+            except Exception:
+                pass
+            # 兜底 ipinfo.io
             with _u.urlopen("https://ipinfo.io/json", timeout=8) as r:
-                loc = _json.loads(r.read().decode())["loc"]
-            return tuple(float(v) for v in loc.split(","))   # lat, lon
+                d = _json.loads(r.read().decode())
+            lat, lon = (float(v) for v in d["loc"].split(","))
+            return lat, lon, d.get("city", "")
 
-        def done(pos):
-            lat, lon = pos
-            # ipinfo 返回 WGS-84 → 转 GCJ-02 落图
+        def done(result):
+            lat, lon, city = result
             from apex_map import wgs84_to_gcj02
             glon, glat = wgs84_to_gcj02(lon, lat)
-            self.map_widget.set_center(glon, glat, 11)
-            self.statusBar().showMessage("已定位到当前城市（IP 粗定位）", 4000)
+            self.map_widget.set_center(glon, glat, 12)
+            # 把起飞点标记放到定位点，坐标顺手就有了
+            self.map_widget.marker = (glon, glat)
+            self.map_widget.marker_changed.emit(glon, glat)
+            self.map_widget.update()
+            where = f"：{city}" if city else ""
+            self.statusBar().showMessage(
+                f"已定位{where}（IP 定位基于运营商出口，可能偏差几公里，"
+                f"请拖动地图手动精调起飞点）", 8000)
 
         self._run_simple_task(work, done, "IP 定位失败：检查网络后重试")
 
@@ -3074,7 +3105,9 @@ class MainWindow(QMainWindow):
         '"gyro_dyn_min": 数值, "gyro_dyn_max": 数值, '
         '"dterm_dyn_min": 数值, "dterm_dyn_max": 数值, '
         '"notch_min": 数值, "notch_max": 数值, "notch_q": 数值}, '
-        '"explanation": "一两句话说明调整思路"}'
+        '"explanation": "一两句话说明调整思路", '
+        '"reasoning": "详细分析：当前数据反映出什么问题、每类参数为什么这么改、'
+        '预期改善什么（分点写，每点一句话）"}'
         "规则：PID 与滤波器必须是整数；Rates 为两位小数；"
         "pid 数组长度必须和用户给的组数一致；"
         "只调整有必要调整的项，其余项照抄当前值；"
@@ -3158,11 +3191,16 @@ class MainWindow(QMainWindow):
             return
         changes, notes = self._validate_autotune(data, self._at_snap)
         explanation = str(data.get("explanation", "")).strip()
+        reasoning = str(data.get("reasoning", "")).strip()
+        # AI 的理解永久留档到对话区
+        if reasoning:
+            self.ai_chat_view.append(
+                "🧠 <b>AI 的理解</b>：\n" + reasoning.replace("\n", "<br>"))
         if not changes:
             self.ai_chat_view.append(
                 "🤖 AI 认为当前参数已经比较合适，无需改动。\n" + explanation)
             return
-        self._show_autotune_dialog(changes, explanation, notes)
+        self._show_autotune_dialog(changes, explanation, notes, reasoning)
 
     def _validate_autotune(self, data: dict, snap: dict):
         """校验并钳制 AI 给出的参数，生成变化清单。
@@ -3265,14 +3303,52 @@ class MainWindow(QMainWindow):
                     changes.append({"kind": "filter", "key": key,
                                     "label": names.get(key, key),
                                     "old": cur_v, "new": v})
+
+        # ---- 交叉安全检查（v0.95）：单项都合法，组合起来可能有风险 ----
+        pid_deltas = {(c["key"][0], c["key"][1]): c["new"] - c["old"]
+                      for c in changes if c["kind"] == "pid"}
+        filt_news = {c["key"]: c["new"] for c in changes
+                     if c["kind"] == "filter"}
+        rate_news = {c["key"]: c["new"] for c in changes
+                     if c["kind"] == "rate"}
+        # D 增大 且 D 项滤波同时放松 → 噪声风险叠加
+        d_up = any(d > 0 for (r, c), d in pid_deltas.items() if c == 2)
+        dterm_relaxed = any(filt_news.get(k, 9999) < cur
+                            for k, cur in (("dterm_dyn_min", 150),
+                                           ("dterm_lpf1_hz", 150))
+                            if k in filt_news)
+        if d_up and dterm_relaxed:
+            notes.append("交叉检查：D 项增大的同时 D 项滤波被放松，"
+                         "噪声风险叠加，建议试飞时留意电机温度")
+        # I < P（BF 默认 I > P，抗风/姿态保持靠 I）
+        for r in range(min(2, len(snap["pid"]))):
+            p_new = next((c["new"] for c in changes
+                          if c["kind"] == "pid" and c["key"] == (r, 0)),
+                         snap["pid"][r][0])
+            i_new = next((c["new"] for c in changes
+                          if c["kind"] == "pid" and c["key"] == (r, 1)),
+                         snap["pid"][r][1])
+            if i_new < p_new:
+                notes.append("交叉检查：横滚/俯仰的 I 小于 P，"
+                             "抗风与姿态保持可能偏弱，试飞注意回中手感")
+                break
+        # 陀螺仪滤波下限过低
+        if filt_news.get("gyro_dyn_min", 9999) < 150:
+            notes.append("交叉检查：陀螺仪动态低通下限低于 150Hz，"
+                         "高频噪声可能直达电机，桨叶损伤时风险大")
+        # Rate 过高
+        if any(k[0] == "rate" and v > 1.2 for k, v in rate_news.items()):
+            notes.append("交叉检查：Rate 超过 1.2，满杆角速度很大，"
+                         "新手建议先低油门适应手感")
         return changes, notes
 
     def _show_autotune_dialog(self, changes: list, explanation: str,
-                              notes: list):
-        """AI 全自动调参对比对话框：哪些加了、哪些减了，一目了然"""
+                              notes: list, reasoning: str = ""):
+        """AI 全自动调参对比对话框：哪些加了、哪些减了、为什么这么调、
+        安不安全——一次讲清楚"""
         dlg = QDialog(self)
         dlg.setWindowTitle("🚀 AI 全自动调参 · 方案对比")
-        dlg.setMinimumWidth(640)
+        dlg.setMinimumWidth(680)
         lay = QVBoxLayout(dlg)
 
         if explanation:
@@ -3311,7 +3387,8 @@ class MainWindow(QMainWindow):
             font.setBold(True)
             d_item.setFont(font)
             table.setItem(i, 3, d_item)
-        table.setMinimumHeight(min(360, 40 + 30 * len(changes)))
+        table.setMinimumHeight(min(300, 40 + 30 * len(changes)))
+        table.setMaximumHeight(300)
         lay.addWidget(table)
 
         summary = QLabel(
@@ -3320,11 +3397,39 @@ class MainWindow(QMainWindow):
             f"<span style='color:#E04545'>↓ 减小 {down} 项</span>")
         summary.setStyleSheet("font-size: 14px;")
         lay.addWidget(summary)
+
+        # 🧠 AI 的理解（为什么这么调）
+        if reasoning:
+            why_box = QGroupBox("🧠 AI 的理解（为什么这么调）")
+            why_lay = QVBoxLayout(why_box)
+            why = QTextEdit()
+            why.setReadOnly(True)
+            why.setPlainText(reasoning)
+            why.setMaximumHeight(130)
+            why.setStyleSheet("color: #C8CDD3;")
+            why_lay.addWidget(why)
+            lay.addWidget(why_box)
+
         if notes:
             note_lab = QLabel("⚠️ " + "\n⚠️ ".join(notes))
             note_lab.setWordWrap(True)
             note_lab.setStyleSheet("color: #E0A545;")
             lay.addWidget(note_lab)
+
+        # 🛡️ 安全性说明（能不能用、会不会损坏设备，如实告知）
+        safe_box = QGroupBox("🛡️ 这套方案安全吗？")
+        safe_lay = QVBoxLayout(safe_box)
+        safe = QLabel(
+            "① 所有数值经过安全钳制，滤波器永远不会被关闭（防烧电机红线）\n"
+            "② 写入前自动备份全部参数到 backups/，随时一键恢复\n"
+            "③ 写入后自动读回校验，写没写上看得见\n"
+            "④ 只改 PID / Rates / 滤波，不动电调、电机协议等硬件设置\n"
+            "⑤ 本地小模型的建议属于启发式经验，不保证最优——"
+            "首次应用请拆桨检查、低空悬停试飞验证再正常飞行")
+        safe.setWordWrap(True)
+        safe.setStyleSheet("color: #9AA0A6;")
+        safe_lay.addWidget(safe)
+        lay.addWidget(safe_box)
 
         btns = QHBoxLayout()
         tip = QLabel("写入前会自动备份当前全部参数，可随时恢复")

@@ -18,8 +18,8 @@ import queue
 import threading
 import urllib.request
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
 
 from apex_fc import PROJECT_ROOT
@@ -151,6 +151,7 @@ class TileManager(QObject):
         self._pending: set = set()
         self._memory: dict = {}                    # key -> QImage
         self._failed: set = set()                  # 失败的 key 不再重试
+        self._not_on_disk: set = set()             # 负缓存：磁盘没有就不再查
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -171,11 +172,14 @@ class TileManager(QObject):
         if key in self._failed:
             return None
         path = self._path(key)
-        if os.path.exists(path):
+        if key not in self._not_on_disk and os.path.exists(path):
             img = QImage(path)
             if not img.isNull():
                 self._memory[key] = img
                 return img
+            self._not_on_disk.add(key)      # 坏文件只查一次
+        elif key not in self._not_on_disk:
+            self._not_on_disk.add(key)      # 不存在也只查一次
         if key not in self._pending:
             self._pending.add(key)
             self._queue.put((key, url_tpl, z, x, y))
@@ -231,6 +235,14 @@ class SlippyMapWidget(QWidget):
         self.marker = None                        # (lon, lat) GCJ-02
         self._drag_from = None
         self._moved = False
+        # v0.95 缩放流畅度：滚轮防抖 + 旧画面拉伸过渡
+        self._zoom_pending = 0
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(140)
+        self._zoom_timer.timeout.connect(self._apply_pending_zoom)
+        self._backdrop_pm: QPixmap | None = None
+        self._backdrop_factor = 1.0
 
     # ---- 状态 ----
     def set_source(self, name: str):
@@ -240,21 +252,54 @@ class SlippyMapWidget(QWidget):
     def set_center(self, lon: float, lat: float, zoom: int = None):
         self.center_lon, self.center_lat = lon, lat
         if zoom is not None:
-            self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
-        self.update()
+            self._zoom_to(zoom)
+        else:
+            self.update()
 
     def zoom_in(self):
-        self.set_center(self.center_lon, self.center_lat, self.zoom + 1)
+        self._zoom_to(self.zoom + 1)
 
     def zoom_out(self):
-        self.set_center(self.center_lon, self.center_lat, self.zoom - 1)
+        self._zoom_to(self.zoom - 1)
+
+    def _zoom_to(self, new_zoom: int):
+        """切换缩放级别：旧画面截图拉伸垫底，新瓦片加载期间不发白"""
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
+        if new_zoom == self.zoom:
+            return
+        self._backdrop_pm = self.grab()
+        self._backdrop_factor = 2.0 ** (new_zoom - self.zoom)
+        self.zoom = new_zoom
+        QTimer.singleShot(700, self._clear_backdrop)
+        self.update()
+
+    def _clear_backdrop(self):
+        self._backdrop_pm = None
+        self.update()
+
+    def _apply_pending_zoom(self):
+        """滚轮连转结束后一次性应用累计缩放（防抖，避免逐级拉瓦片）"""
+        if self._zoom_pending:
+            pending, self._zoom_pending = self._zoom_pending, 0
+            self._zoom_to(self.zoom + pending)
 
     # ---- 绘制 ----
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#101216"))
-        src = TILE_SOURCES[self.source_name]
         w, h = self.width(), self.height()
+
+        # 缩放过渡：先把旧画面拉伸垫底（新瓦片加载期间画面连续）
+        if self._backdrop_pm is not None:
+            p.save()
+            p.translate(w / 2, h / 2)
+            p.scale(self._backdrop_factor, self._backdrop_factor)
+            p.translate(-w / 2, -h / 2)
+            p.setOpacity(0.85)
+            p.drawPixmap(0, 0, self._backdrop_pm)
+            p.restore()
+
+        src = TILE_SOURCES[self.source_name]
         cx, cy = lonlat_to_world(self.center_lon, self.center_lat, self.zoom)
         n = 2 ** self.zoom
         x0 = int((cx - w / 2) // TILE)
@@ -275,7 +320,7 @@ class SlippyMapWidget(QWidget):
                     if img is not None:
                         p.drawImage(int(px), int(py), img)
                         drew = True
-                if not drew:
+                if not drew and self._backdrop_pm is None:
                     p.fillRect(int(px), int(py), TILE, TILE,
                                QColor("#1A1D22"))
 
@@ -332,8 +377,10 @@ class SlippyMapWidget(QWidget):
             self._drag_from = None
 
     def wheelEvent(self, e):
+        """滚轮缩放：累计滚动量，停顿 140ms 后一次性应用（防抖）"""
         delta = e.angleDelta().y()
         if delta > 0:
-            self.zoom_in()
+            self._zoom_pending += 1
         elif delta < 0:
-            self.zoom_out()
+            self._zoom_pending -= 1
+        self._zoom_timer.start()

@@ -29,11 +29,14 @@ built = {}
 class _SpyDialog(QDialog):
     def exec(self):
         built["table"] = self.findChild(QTableWidget)
+        from PyQt6.QtWidgets import QGroupBox
+        built["groups"] = {g.title() for g in self.findChildren(QGroupBox)}
         return QDialog.DialogCode.Rejected
 
 
 m.QDialog = _SpyDialog            # main 模块内 QDialog 换成侦察版
-win._show_autotune_dialog(changes, "测试思路说明", notes)
+win._show_autotune_dialog(changes, "测试思路说明", notes,
+                          "噪声偏大所以降 D；跟踪滞后所以加 P。")
 m.QDialog = QDialog               # 还原
 
 table = built.get("table")
@@ -41,4 +44,7 @@ assert table is not None, "对话框未构建"
 assert table.rowCount() == 4 and table.columnCount() == 4
 assert table.item(0, 3).text().startswith("↑"), table.item(0, 3).text()
 assert table.item(1, 3).text().startswith("↓"), table.item(1, 3).text()
+groups = built.get("groups", set())
+assert any("AI 的理解" in g for g in groups), f"缺 AI 理解区块: {groups}"
+assert any("安全" in g for g in groups), f"缺安全性说明区块: {groups}"
 print("AUTOTUNE_DIALOG_OK")
