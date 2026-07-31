@@ -36,7 +36,8 @@ try:
     from PyQt6.QtGui import (
         QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap)
     from PyQt6.QtWidgets import (
-        QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+        QAbstractButton, QApplication, QCheckBox, QComboBox, QDialog,
+        QDoubleSpinBox,
         QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
         QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
         QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
