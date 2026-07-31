@@ -864,6 +864,50 @@ CHANNEL_NAMES = {
     "rssi": "信号强度 RSSI",
 }
 
+# 通道用途说明（鼠标悬停 / 「通道用途」按钮都会用到）
+CHANNEL_HELP = {
+    "gyroADC[0]": "飞机实际的横滚角速度（°/s）。调参最核心的通道：和设定值对比看"
+                  "跟踪效果；波形毛刺多 = 滤波不够，来回振荡 = P/D 过高。",
+    "gyroADC[1]": "飞机实际的俯仰角速度（°/s）。用途同横滚：看响应是否跟手、"
+                  "有没有振动噪声。",
+    "gyroADC[2]": "飞机实际的偏航角速度（°/s）。偏航振荡常见于机架共振或"
+                  "偏航 PID 过激。",
+    "setpoint[0]": "飞控根据打杆算出的横滚目标角速度。和 gyroADC[0] 对比："
+                   "滞后大 → 可加 P 或 FeedForward；超调多 → 加 D 或减 P。",
+    "setpoint[1]": "俯仰目标角速度，用途同上。",
+    "setpoint[2]": "偏航目标角速度，用途同上。",
+    "setpoint[3]": "目标油门。看油门突变时其他通道是否被干扰（掉压导致抖动）。",
+    "rcCommand[0]": "遥控器横滚原始指令。排查打杆没反应、通道反向、"
+                    "接收机信号抖动时用。",
+    "rcCommand[1]": "遥控器俯仰原始指令，用途同上。",
+    "rcCommand[2]": "遥控器偏航原始指令，用途同上。",
+    "rcCommand[3]": "遥控器油门原始指令，用途同上。",
+    "axisP[0]": "P 项（比例）横滚输出。波形高频振荡 → P 太高；"
+                "跟踪缓慢无力 → P 偏低。",
+    "axisP[1]": "P 项俯仰输出，用途同上。",
+    "axisP[2]": "P 项偏航输出，用途同上。",
+    "axisI[0]": "I 项（积分）横滚输出，负责消除持续误差（风阻、重心偏移）。"
+                "长期偏离零属正常；机身缓慢来回摆动 → I 太高。",
+    "axisI[1]": "I 项俯仰输出，用途同上。",
+    "axisI[2]": "I 项偏航输出，用途同上。",
+    "axisD[0]": "D 项（微分）横滚输出，抑制过冲和回弹。D 太大 → 电机发热、"
+                "放大高频噪声；洗桨（急转后抖动）明显 → 可适当加 D。",
+    "axisD[1]": "D 项俯仰输出，用途同上。",
+    "axisD[2]": "D 项偏航输出，用途同上。",
+    "motor[0]": "电机 1 输出（1000~2000）。长期贴顶（≈2000 饱和）→ 重心偏、"
+                "机架损伤或该轴 PID 过激；几个电机差值大 → 机架不对称。",
+    "motor[1]": "电机 2 输出，用途同上。",
+    "motor[2]": "电机 3 输出，用途同上。",
+    "motor[3]": "电机 4 输出，用途同上。",
+    "vbatLatest": "电池电压。满油门时掉压厉害 → 电池老化或放电倍率不够；"
+                  "松油门后回升缓慢 → 内阻偏大。",
+    "amperageLatest": "瞬时电流。看功耗峰值、排查异常耗电。",
+    "rssi": "链路信号强度（0~99 或百分比）。定位失控、信号弱发生在什么时间。",
+}
+CHANNEL_HELP_DEFAULT = ("该通道的详细含义可对照 Betaflight 黑匣子文档。"
+                        "一般来说： gyro 类看噪声与跟踪，setpoint/rcCommand 类"
+                        "看输入，axisP/I/D 类看 PID 各项出力，motor 类看饱和。")
+
 
 class BlackboxError(Exception):
     """黑匣子日志处理错误"""
@@ -2156,7 +2200,20 @@ class MainWindow(QMainWindow):
 
         # ---- 左侧控制面板 ----
         left = QVBoxLayout()
-        left.addWidget(QLabel("选择通道（打开开关即选中）："))
+        # 通道选择标题行：全选 / 清空 / 通道用途说明
+        ch_head = QHBoxLayout()
+        ch_head.addWidget(QLabel("选择通道："))
+        self.bb_all_btn = QPushButton("全选")
+        self.bb_all_btn.clicked.connect(lambda: self.on_bb_select_all(True))
+        ch_head.addWidget(self.bb_all_btn)
+        self.bb_none_btn = QPushButton("清空")
+        self.bb_none_btn.clicked.connect(lambda: self.on_bb_select_all(False))
+        ch_head.addWidget(self.bb_none_btn)
+        self.bb_help_btn = QPushButton("❓ 通道用途")
+        self.bb_help_btn.clicked.connect(self.on_bb_channel_help)
+        ch_head.addWidget(self.bb_help_btn)
+        ch_head.addStretch()
+        left.addLayout(ch_head)
         # 通道开关列表（仿 BF 的 toggle 样式），放在滚动区里
         self.bb_channel_scroll = QScrollArea()
         self.bb_channel_scroll.setWidgetResizable(True)
@@ -2372,14 +2429,19 @@ class MainWindow(QMainWindow):
         self.bb_toggles = {}
         for col in self.bb_columns:
             display = CHANNEL_NAMES.get(col, col)
+            # 悬停提示：原始列名 + 这个通道是干什么的
+            tip = f"{col}\n\n{CHANNEL_HELP.get(col, CHANNEL_HELP_DEFAULT)}"
             row = QHBoxLayout()
             toggle = ToggleSwitch()
+            toggle.setToolTip(tip)
             toggle.toggled.connect(lambda _on: self.on_bb_plot())  # 开关即重绘
             row.addWidget(toggle)
             name_label = QLabel(display)
+            name_label.setToolTip(tip)
             row.addWidget(name_label, 1)
             row_widget = QWidget()
             row_widget.setLayout(row)
+            row_widget.setToolTip(tip)
             self.bb_channel_rows.addWidget(row_widget)
             self.bb_toggles[col] = toggle
         self.bb_channel_rows.addStretch()
@@ -2397,6 +2459,34 @@ class MainWindow(QMainWindow):
         """返回所有开关处于打开状态的通道（保持原始列顺序）"""
         return [col for col, toggle in self.bb_toggles.items()
                 if toggle.isChecked()]
+
+    def on_bb_select_all(self, checked: bool):
+        """全选/清空通道（屏蔽信号批量设置，只重绘一次）"""
+        if not self.bb_toggles:
+            self.statusBar().showMessage("请先加载日志文件")
+            return
+        for toggle in self.bb_toggles.values():
+            toggle.blockSignals(True)
+            toggle.setChecked(checked)
+            toggle.blockSignals(False)
+        if checked and len(self.bb_toggles) > 16:
+            self.statusBar().showMessage(
+                f"已全选 {len(self.bb_toggles)} 个通道：一次最多绘制 16 个，"
+                "建议用「清空」后只开需要的通道")
+            return
+        self.on_bb_plot()
+
+    def on_bb_channel_help(self):
+        """弹出各通道用途说明"""
+        docs = []
+        for col in (self.bb_columns or CHANNEL_NAMES.keys()):
+            display = CHANNEL_NAMES.get(col, col)
+            docs.append(f"【{display}】\n"
+                        f"{CHANNEL_HELP.get(col, CHANNEL_HELP_DEFAULT)}")
+        QMessageBox.information(
+            self, "通道用途说明",
+            "每个通道是干什么的：\n\n" + "\n\n".join(docs)
+            + "\n\n提示：鼠标悬停在通道开关上也能看到这条说明。")
 
     def _bb_slice(self, values: list) -> tuple:
         """按时间范围控件裁剪数据，返回 (时间, 数值)"""
@@ -2419,8 +2509,10 @@ class MainWindow(QMainWindow):
         if not selected:
             self.statusBar().showMessage("请先勾选至少一个通道")
             return
-        if len(selected) > 10:
-            self.statusBar().showMessage("一次最多绘制 10 个通道，请减少选择")
+        if len(selected) > 16:
+            self.statusBar().showMessage(
+                f"已选择 {len(selected)} 个通道：一次最多绘制 16 个，"
+                "请关闭一部分（轨道太多会挤在一起看不清）")
             return
 
         normalize = self.bb_normalize.isChecked()
