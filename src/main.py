@@ -3231,7 +3231,8 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
             "注意：滤波器截止频率 0 表示该滤波器已关闭；"
             "电机饱和时间占比高说明机架/重心/PID 可能有问题；"
             "跟踪滞后大可以考虑加 FeedForward 或 P。\n\n" + context)
-        self._ai_ask(prompt)
+        # 确定性采样（v1.01）：固定 seed + 低温，同样数据必然同样建议
+        self._ai_ask(prompt, options={"temperature": 0.2, "seed": 42})
 
     # ---------- v0.93：AI 全自动调参（招牌功能） ----------
 
@@ -3299,7 +3300,9 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
         self.ai_autotune_btn.setEnabled(False)
         self.ai_chat_view.append(
             "🚀 <b>AI 全自动调参</b>：正在分析全部数据并计算新参数，"
-            "请稍候……")
+            "请稍候……<br><span style='color:#9AA0A6;'>确定性模式"
+            "（temperature=0 + 固定 seed）：同样的数据必然得到"
+            "同样的建议，两次结果可对比。</span>")
         log_event("AI 全自动调参：开始分析")
 
         import threading as _th
@@ -3648,8 +3651,8 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
         if rc_raw is not None and filter_raw is not None:
             self.worker.write_tuning(rc_raw, filter_raw)
 
-    def _ai_ask(self, user_text: str):
-        """发起一轮 AI 对话（统一入口）"""
+    def _ai_ask(self, user_text: str, options: dict | None = None):
+        """发起一轮 AI 对话（统一入口）；options 为 Ollama 采样参数（v1.01）"""
         if self._ai_busy:
             self.statusBar().showMessage("AI 正在回答中，请稍候……")
             return
@@ -3674,7 +3677,7 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
         # 完整对话历史（含系统提示词）发给后台线程
         messages = ([{"role": "system", "content": AI_SYSTEM_PROMPT}]
                     + self._ai_messages[-10:])   # 只带最近 10 条，控制上下文长度
-        self._run_in_thread(self.ai.chat, model, messages)
+        self._run_in_thread(self.ai.chat, model, messages, options)
 
     def _ai_stop(self):
         self.ai.cancel()

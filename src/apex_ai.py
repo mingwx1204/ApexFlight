@@ -42,15 +42,22 @@ def ollama_status() -> tuple[bool, list]:
 
 
 def chat_blocking(model: str, messages: list, timeout: int = 180,
-                  json_mode: bool = False) -> str:
+                  json_mode: bool = False,
+                  options: dict | None = None) -> str:
     """非流式对话（必须在后台线程调用），返回完整回答文本。
 
     json_mode=True 时使用 Ollama 的 format=json 强制合法 JSON 输出，
     用于 AI 全自动调参这类需要结构化结果的场景（v0.93）。
+    json_mode 默认附带确定性采样（temperature=0 + 固定 seed）：同样的
+    输入数据必然得到同样的建议参数，结果可复现、可对比（v1.01）。
     """
     body_dict = {"model": model, "messages": messages, "stream": False}
     if json_mode:
         body_dict["format"] = "json"
+        body_dict["options"] = {"temperature": 0.0, "seed": 42,
+                                **(options or {})}
+    elif options:
+        body_dict["options"] = options
     body = json.dumps(body_dict).encode("utf-8")
     req = urllib.request.Request(
         OLLAMA_BASE_URL + "/api/chat", data=body,
@@ -225,17 +232,22 @@ class AIBridge(QObject):
         """请求中断当前回答（由界面线程调用，线程安全）"""
         self._cancel.set()
 
-    def chat(self, model: str, messages: list):
+    def chat(self, model: str, messages: list,
+             options: dict | None = None):
         """
         阻塞式流式对话（必须在后台线程调用）。
         messages: [{"role": "system"/"user"/"assistant", "content": "..."}, ...]
+        options: Ollama 采样参数（temperature/seed 等，v1.01）
         """
         self._cancel.clear()
-        body = json.dumps({
+        payload = {
             "model": model,
             "messages": messages,
             "stream": True,
-        }).encode("utf-8")
+        }
+        if options:
+            payload["options"] = options
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             OLLAMA_BASE_URL + "/api/chat", data=body,
             headers={"Content-Type": "application/json"})
