@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 ApexFlight —— 开源无人机调参软件
-v0.5：实时仪表盘 + PID 在线调参（写入/备份/恢复）+ Rates 调参（曲线可视化）
-      + 滤波器设置（与黑匣子频谱联动）+ 调参方案管理（预设保存/一键切换）
-      + 电机测试 + 接收机通道监视 + 黑匣子分析（文件/闪存下载/频谱）
-      + 本地 AI 助手（Ollama）
+v0.7：实时仪表盘 + PID/Rates/滤波在线调参 + 调参方案管理
+      + 电机测试 + 接收机监视 + 黑匣子分析（闪存下载/频谱/双日志对比）
+      + 日志类型智能判别（飞行 vs 地面空转）+ 本地 AI 助手（Ollama）
+
+代码结构（v0.7 起按职责拆分）：
+    apex_msp.py      MSP 协议编解码（v1/v2 帧、CRC8）
+    apex_fc.py       飞控查询/写入、备份、调参快照
+    apex_blackbox.py 黑匣子解码、统计、日志类型判别
+    apex_ai.py       Ollama AI 助手通信
+    apex_widgets.py  自定义控件（开关、姿态仪）
+    main.py          后台串口线程 + 主窗口 + 入口（本文件）
 
 运行方式：
     1. 安装依赖：  pip install -r requirements.txt
     2. 运行程序：  python src/main.py   （或双击 启动ApexFlight.bat）
 
-技术栈：
-    - 界面：PyQt6
-    - 串口：pyserial
-    - 协议：MSP v1（MultiWii Serial Protocol）
-    - 所有串口操作在后台线程执行，界面不卡死
+技术栈：PyQt6 + pyserial + MSP v1/v2；所有串口操作在后台线程执行。
 """
 
-import csv
-import json
-import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -55,1129 +53,12 @@ try:
 except ImportError:
     HAS_MPL = False
 
-# ============================================================
-# 第一部分：MSP 协议（MultiWii Serial Protocol v1）
-# ============================================================
-# MSP v1 数据帧格式：
-#   请求帧：  '$' 'M' '<'  数据长度(1字节)  命令码(1字节)  [数据...]  校验和(1字节)
-#   响应帧：  '$' 'M' '>'  数据长度(1字节)  命令码(1字节)  [数据...]  校验和(1字节)
-#   错误帧：  '$' 'M' '!'  ...（飞控拒绝该命令）
-#   校验和 = 数据长度、命令码、所有数据字节的异或（XOR）
-
-# 本程序用到的 MSP 命令码
-MSP_API_VERSION = 1      # MSP 协议版本
-MSP_FC_VARIANT = 2       # 固件名称（如 "BTFL" = Betaflight）
-MSP_FC_VERSION = 3       # 固件版本号（3 字节：主.次.修订）
-MSP_BOARD_INFO = 4       # 飞控板信息
-MSP_IDENT = 100          # 老版识别命令（新固件已废弃，代码做了兼容）
-MSP_MOTOR = 104          # 电机输出值（8 个电机，每个 2 字节）
-MSP_RC = 105             # 接收机通道值（N 个通道，每个 2 字节）
-MSP_ATTITUDE = 108       # 姿态角：横滚/俯仰/偏航
-MSP_ANALOG = 110         # 电压、电流、RSSI 等模拟量
-MSP_PID = 112            # 读取 PID 参数
-MSP_STATUS_EX = 150      # 扩展状态：CPU 负载、解锁禁用标志等
-MSP_SET_PID = 202        # 写入 PID 参数
-MSP_SET_MOTOR = 214      # 直接控制电机输出（电机测试用）
-MSP_EEPROM_WRITE = 250   # 把当前配置保存到飞控闪存（断电不丢失）
-MSP_DATAFLASH_SUMMARY = 70   # 板载闪存信息（黑匣子存储芯片）
-MSP_DATAFLASH_READ = 71      # 读取板载闪存数据（黑匣子日志原始字节）
-MSP_DATAFLASH_ERASE = 72     # 清空板载闪存（擦除整颗芯片，耗时几十秒）
-MSP_FILTER_CONFIG = 92       # 读取滤波器配置（低通/陷波/RPM 滤波）
-MSP_SET_FILTER_CONFIG = 93   # 写入滤波器配置
-MSP_RC_TUNING = 111          # 读取 Rates/Expo/油门曲线等摇杆调参
-MSP_SET_RC_TUNING = 204      # 写入摇杆调参
-
-# MSP_IDENT 返回的机型代码对照表（老固件用）
-MULTITYPE_NAMES = {
-    1: "三轴 (Tri)", 2: "四轴 + (Quad +)", 3: "四轴 X (Quad X)",
-    4: "双轴 (Bi)", 5: "云台 (Gimbal)", 6: "Y6", 7: "六轴 + (Hex 6 +)",
-    8: "飞翼 (Flying Wing)", 9: "Y4", 10: "六轴 X (Hex 6 X)",
-    11: "八轴 X8 (Octo X8)", 12: "八轴扁平 + (Octo Flat +)",
-    13: "八轴扁平 X (Octo Flat X)", 14: "飞机 (Airplane)",
-    15: "直升机 120 (Heli 120)", 16: "直升机 90 (Heli 90)",
-    17: "垂直起降 (VTail)", 18: "四轴 H (Quad H)",
-}
-
-# Betaflight 4.4+ 精简后的 5 组 PID 名称；老固件 10 组用后面的旧表
-PID_NAMES_MODERN = ["Roll（横滚）", "Pitch（俯仰）", "Yaw（偏航）",
-                    "Level（自稳强度）", "Mag（磁航向保持）"]
-PID_NAMES_LEGACY = ["Roll（横滚）", "Pitch（俯仰）", "Yaw（偏航）",
-                    "Alt（定高）", "Pos（定点）", "PosR（位置速率）",
-                    "NavR（导航速率）", "Level（自稳）", "Mag（磁航向）",
-                    "Vel（速度）"]
-
-# 解锁禁用标志（arming disable flags）位含义
-# 与 Betaflight 4.5 源码 fc/runtime_config.h 中 armingDisableFlags_e 一致
-ARMING_DISABLE_FLAGS = {
-    0: "NOGYRO（未检测到陀螺仪）",
-    1: "FAILSAFE（失控保护激活）",
-    2: "RX_FAILSAFE（接收机失控）",
-    3: "NOT_DISARMED（接收机恢复时解锁开关未复位）",
-    4: "BOXFAILSAFE（失控保护开关打开）",
-    5: "RUNAWAY（起飞保护触发）",
-    6: "CRASH（摔机检测触发）",
-    7: "THROTTLE（油门过高）",
-    8: "ANGLE（机身倾斜角度过大）",
-    9: "BOOTGRACE（开机保护时间内）",
-    10: "NOPREARM（预解锁未开启）",
-    11: "LOAD（CPU 负载过高）",
-    12: "CALIB（传感器校准中）",
-    13: "CLI（命令行模式激活）",
-    14: "CMS（OSD 菜单打开）",
-    15: "BST（黑羊设备阻止解锁）",
-    16: "MSP（调参连接占用中）",
-    17: "PARALYZE（瘫痪模式）",
-    18: "GPS（GPS 救援卫星不足）",
-    19: "RESCUE_SW（GPS 救援开关打开）",
-    20: "RPMFILTER（电机 RPM 滤波无数据）",
-    21: "REBOOT_REQD（需要重启生效）",
-    22: "DSHOT_BBANG（DSHOT 位带模式故障）",
-    23: "NO_ACC_CAL（加速度计未校准）",
-    24: "MOTOR_PROTO（电调协议未配置）",
-    25: "ARMSWITCH（解锁开关位置不安全）",
-    26: "DSHOT_TELEM（DSHOT 遥测无数据）",
-}
-
-# 项目根目录（src 的上一级）与备份文件夹
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BACKUP_DIR = PROJECT_ROOT / "backups"
-ICON_PATH = PROJECT_ROOT / "assets" / "icon.png"
-# 官方黑匣子解码器（cleanflight/blackbox-tools，可把 .bbl/.bfl 转成 CSV）
-BLACKBOX_DECODER = PROJECT_ROOT / "tools" / "blackbox_decode.exe"
-# 演示日志存放目录
-LOGS_DIR = PROJECT_ROOT / "logs"
-
-
-class MspError(Exception):
-    """MSP 通信错误（校验失败、飞控拒绝、超时等）"""
-    pass
-
-
-def build_msp_request(cmd: int, payload: bytes = b"") -> bytes:
-    """
-    构造一个 MSP v1 请求帧。
-    参数：cmd = 命令码，payload = 附加数据（查询类命令为空）
-    返回：可直接写入串口的完整字节串
-    """
-    size = len(payload)
-    checksum = size ^ cmd                     # 校验和 = 长度 XOR 命令码 XOR 数据
-    for byte in payload:
-        checksum ^= byte
-    return b"$M<" + bytes([size, cmd]) + payload + bytes([checksum])
-
-
-def read_msp_response(ser: serial.Serial, expected_cmd: int,
-                      timeout: float = 2.0) -> bytes:
-    """从串口读取并解析一帧 MSP 响应，失败抛出 MspError。"""
-    deadline = time.time() + timeout
-
-    def read_n(n: int) -> bytes:
-        """读取 n 个字节，超时抛异常"""
-        buf = b""
-        while len(buf) < n:
-            if time.time() > deadline:
-                raise MspError("读取超时：飞控无响应（检查串口选择、飞控供电、"
-                               "是否有其他程序占用串口）")
-            chunk = ser.read(n - len(buf))
-            if chunk:
-                buf += chunk
-        return buf
-
-    # 定位帧头 '$M'
-    while True:
-        if read_n(1) == b"$" and read_n(1) == b"M":
-            break
-
-    direction = read_n(1)
-    if direction == b"!":                     # 飞控拒绝此命令
-        size = read_n(1)[0]
-        cmd = read_n(1)[0]
-        read_n(size + 1)
-        raise MspError(f"飞控拒绝了命令 {cmd}（该固件可能不支持）")
-    if direction != b">":
-        raise MspError("收到无法识别的 MSP 数据帧")
-
-    size = read_n(1)[0]
-    cmd = read_n(1)[0]
-    payload = read_n(size)
-    checksum_byte = read_n(1)[0]
-
-    checksum = size ^ cmd                     # XOR 校验
-    for byte in payload:
-        checksum ^= byte
-    if checksum != checksum_byte:
-        raise MspError("数据校验失败（XOR 校验和不匹配）")
-    if cmd != expected_cmd:
-        raise MspError(f"命令码不匹配：期望 {expected_cmd}，实际 {cmd}")
-    return payload
-
-
-# 串口访问锁：所有 MSP 请求共用。
-# 快通道（100ms）和慢通道（700ms）轮询运行在不同线程中，
-# 如果不加锁，两个线程会同时读写同一个串口，字节流交错导致
-# 双方解析到损坏的数据帧，进而超时卡死。
-# 每条 MSP 请求是"清空缓冲区 → 发送 → 读完整个响应"的原子操作，
-# 在请求级别加锁即可杜绝交错。
-_MSP_LOCK = threading.Lock()
-
-
-def msp_request(ser: serial.Serial, cmd: int, payload: bytes = b"",
-                timeout: float = 2.0) -> bytes:
-    """发送一条 MSP 命令并等待响应（线程安全，全程持锁）。"""
-    with _MSP_LOCK:
-        ser.reset_input_buffer()              # 丢弃缓冲区里的旧数据
-        ser.write(build_msp_request(cmd, payload))
-        ser.flush()
-        return read_msp_response(ser, cmd, timeout)
-
-
-# ============================================================
-# MSP v2（"$X" 帧）：支持超长数据（16 位长度 + CRC8 校验）
-# ============================================================
-# v2 帧格式：
-#   '$' 'X' 方向  标志(1字节)  命令码(2字节小端)  长度(2字节小端)  [数据...]  CRC8(1字节)
-#   CRC 算法：CRC8-DVB-S2（多项式 0xD5，初值 0x00），覆盖 标志~数据 全部字节
-# 用途：MSP_DATAFLASH_READ 用 v2 单帧最多可返回约 4KB 数据，
-#       实测下载速度从 v1 的 6KB/s 提升到约 47KB/s（7~8 倍）。
-
-def crc8_dvb_s2(data: bytes) -> int:
-    """CRC8-DVB-S2 校验（MSPv2 帧的校验算法）"""
-    crc = 0
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ 0xD5) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
-    return crc
-
-
-def build_msp2_request(cmd: int, payload: bytes = b"") -> bytes:
-    """构造一个 MSP v2 请求帧（支持最长 65535 字节数据）"""
-    body = (bytes([0])                                # 标志位：请求固定为 0
-            + cmd.to_bytes(2, "little")
-            + len(payload).to_bytes(2, "little")
-            + payload)
-    return b"$X<" + body + bytes([crc8_dvb_s2(body)])
-
-
-def read_msp2_response(ser: serial.Serial, expected_cmd: int,
-                       timeout: float = 5.0) -> bytes:
-    """从串口读取并解析一帧 MSP v2 响应，失败抛出 MspError。"""
-    deadline = time.time() + timeout
-
-    def read_n(n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            if time.time() > deadline:
-                raise MspError("读取超时：飞控无响应")
-            chunk = ser.read(n - len(buf))
-            if chunk:
-                buf += chunk
-        return buf
-
-    # 定位帧头 '$X'
-    while True:
-        if read_n(1) == b"$" and read_n(1) == b"X":
-            break
-
-    direction = read_n(1)
-    flag = read_n(1)[0]
-    cmd = int.from_bytes(read_n(2), "little")
-    size = int.from_bytes(read_n(2), "little")
-    payload = read_n(size)
-    crc_byte = read_n(1)[0]
-
-    if direction == b"!":                     # 飞控拒绝此命令
-        raise MspError(f"飞控拒绝了命令 {cmd}（该固件可能不支持）")
-    if direction != b">":
-        raise MspError("收到无法识别的 MSPv2 数据帧")
-
-    body = bytes([flag]) + cmd.to_bytes(2, "little") \
-        + size.to_bytes(2, "little") + payload
-    if crc8_dvb_s2(body) != crc_byte:
-        raise MspError("数据校验失败（CRC8 不匹配）")
-    if cmd != expected_cmd:
-        raise MspError(f"命令码不匹配：期望 {expected_cmd}，实际 {cmd}")
-    return payload
-
-
-def msp2_request(ser: serial.Serial, cmd: int, payload: bytes = b"",
-                 timeout: float = 5.0) -> bytes:
-    """发送一条 MSP v2 命令并等待响应（与 v1 共用同一把串口锁）。"""
-    with _MSP_LOCK:
-        ser.reset_input_buffer()
-        ser.write(build_msp2_request(cmd, payload))
-        ser.flush()
-        return read_msp2_response(ser, cmd, timeout)
-
-
-def u16(data: bytes, offset: int) -> int:
-    """从字节串中按小端序读取 2 字节无符号整数"""
-    return data[offset] | (data[offset + 1] << 8)
-
-
-def s16(data: bytes, offset: int) -> int:
-    """从字节串中按小端序读取 2 字节有符号整数"""
-    value = u16(data, offset)
-    return value - 65536 if value >= 32768 else value
-
-
-# ============================================================
-# 第二部分：飞控数据查询与写入
-# ============================================================
-
-def query_flight_controller(ser: serial.Serial) -> dict:
-    """查询飞控基本信息：固件版本、板子型号、机型/电机。"""
-    info = {"firmware": "未知", "board": "未知", "motors": "未知"}
-
-    # 固件版本（3 字节：主.次.修订）
-    try:
-        data = msp_request(ser, MSP_FC_VERSION)
-        if len(data) >= 3:
-            info["firmware"] = f"Betaflight {data[0]}.{data[1]}.{data[2]}"
-    except MspError:
-        pass
-
-    # 固件名称确认（应为 "BTFL"）
-    try:
-        data = msp_request(ser, MSP_FC_VARIANT)
-        variant = data[:4].decode("ascii", errors="replace")
-        if variant != "BTFL":
-            info["firmware"] += f"（注意：检测到固件为 {variant}）"
-    except MspError:
-        pass
-
-    # 飞控板型号（MSP_BOARD_INFO，Betaflight 4.x 格式）
-    #   前 4 字节 = 短代号（如 SH74）；第 8 字节起 = 两个长度前缀字符串：
-    #   MCU 目标名（如 STM32H743）和板子完整名（如 DAKEFPVH743）
-    try:
-        data = msp_request(ser, MSP_BOARD_INFO)
-        if len(data) >= 4:
-            short_id = data[:4].decode("ascii", errors="replace")
-            mcu_name, board_name = "", ""
-            if len(data) >= 9:
-                n1 = data[8]
-                if 9 + n1 <= len(data):
-                    mcu_name = data[9:9 + n1].decode("ascii", errors="replace")
-                    pos = 9 + n1
-                    if pos + 1 <= len(data):
-                        n2 = data[pos]
-                        if n2 > 0 and pos + 1 + n2 <= len(data):
-                            board_name = data[pos + 1:pos + 1 + n2].decode(
-                                "ascii", errors="replace")
-            if board_name:
-                info["board"] = f"{board_name}（{mcu_name}，代号 {short_id}）"
-            elif mcu_name:
-                info["board"] = f"{mcu_name}（板子代号 {short_id}）"
-            else:
-                info["board"] = short_id
-    except MspError:
-        pass
-
-    # 机型/电机：先尝试老命令 MSP_IDENT，失败则用 MSP_MOTOR 数电机通道
-    try:
-        data = msp_request(ser, MSP_IDENT)
-        if len(data) >= 2:
-            info["motors"] = MULTITYPE_NAMES.get(data[1], f"机型代码 {data[1]}")
-    except MspError:
-        try:
-            data = msp_request(ser, MSP_MOTOR)
-            info["motors"] = f"{len(data) // 2} 个电机通道"
-        except MspError:
-            pass
-    return info
-
-
-def query_pid(ser: serial.Serial) -> tuple:
-    """
-    读取全部 PID 参数（MSP_PID）。
-    每组 3 字节（P、I、D）。新固件返回 5 组（15 字节），老固件 10 组（30 字节）。
-    返回：(名称列表, 数值列表)，数值列表元素为 (P, I, D) 元组。
-    """
-    data = msp_request(ser, MSP_PID)
-    if len(data) < 9 or len(data) % 3 != 0:
-        raise MspError(f"PID 数据长度异常：实际 {len(data)} 字节")
-
-    count = len(data) // 3
-    if count == 5:
-        names = PID_NAMES_MODERN
-    elif count == 10:
-        names = PID_NAMES_LEGACY
-    else:                                     # 未知固件：用通用名称
-        names = [f"PID {i + 1}" for i in range(count)]
-
-    values = []
-    for i in range(count):
-        values.append((data[i * 3], data[i * 3 + 1], data[i * 3 + 2]))
-    return names, values
-
-
-def write_pid(ser: serial.Serial, values: list, save_eeprom: bool = True):
-    """
-    把 PID 参数写回飞控（MSP_SET_PID），然后保存到闪存（MSP_EEPROM_WRITE）。
-    参数：values = [(P, I, D), ...]，与读取时的组数一致
-    """
-    payload = bytes(v for triple in values for v in triple)
-    msp_request(ser, MSP_SET_PID, payload)
-    if save_eeprom:
-        # 保存到闪存耗时较长（飞控要写 Flash），超时放宽到 5 秒
-        msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
-
-
-# ------------------------------------------------------------
-# Rates / 摇杆调参（MSP_RC_TUNING / MSP_SET_RC_TUNING）
-# ------------------------------------------------------------
-# Betaflight 4.5 的 MSP_RC_TUNING 响应布局（23 字节，与固件 msp.c 一致）：
-#   0  rcRates[横滚]      1  rcExpo[横滚]      2~4 rates[横滚/俯仰/偏航]
-#   5  (旧 tpa_rate，已废弃) 6 油门中点  7 油门 expo  8~9 (旧 tpa 断点 u16)
-#   10 rcExpo[偏航]  11 rcRates[偏航]  12 rcRates[俯仰]  13 rcExpo[俯仰]
-#   14 油门限幅类型  15 油门限幅百分比
-#   16~21 三轴角速度上限（u16 × 3）  22 Rates 类型（0=Betaflight 经典）
-# 所有比例值存储为 百分数整数（150 = 1.50）。
-# 写入策略：先完整读取 23 字节，只修改我们理解的字节，原样写回其余字节
-# （read-modify-write），未知/废弃字段保持不变，兼容性最好。
-
-def query_rc_tuning(ser: serial.Serial) -> bytes:
-    """读取 Rates 调参原始数据（MSP_RC_TUNING），返回原始字节串"""
-    return msp_request(ser, MSP_RC_TUNING)
-
-
-def write_rc_tuning(ser: serial.Serial, raw: bytes, save_eeprom: bool = True):
-    """把修改后的 23 字节 Rates 数据写回飞控"""
-    msp_request(ser, MSP_SET_RC_TUNING, bytes(raw))
-    if save_eeprom:
-        msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
-
-
-# 三个可调字段 × 三轴（横滚/俯仰/偏航）在 23 字节中的偏移
-RC_FIELD_OFFSETS = {
-    "rc_rate": [0, 12, 11],     # 中位灵敏度（RC Rate）
-    "expo":    [1, 13, 10],     # 中位指数（Expo）
-    "rate":    [2, 3, 4],       # 满杆速率（Super Rate）
-}
-
-
-def parse_rc_tuning(raw: bytes) -> dict:
-    """把 23 字节原始数据解析成可读字典（比例值已除以 100）"""
-    if len(raw) < 23:
-        raise MspError(f"Rates 数据长度异常：实际 {len(raw)} 字节（需 23）")
-    return {
-        "rc_rate": [raw[0] / 100, raw[12] / 100, raw[11] / 100],  # R, P, Y
-        "expo":    [raw[1] / 100, raw[13] / 100, raw[10] / 100],
-        "rate":    [raw[2] / 100, raw[3] / 100, raw[4] / 100],
-        "thr_mid": raw[6] / 100,
-        "thr_expo": raw[7] / 100,
-        "thr_limit_pct": raw[15],
-        "rate_limit": [u16(raw, 16), u16(raw, 18), u16(raw, 20)],
-        "rates_type": raw[22],
-    }
-
-
-def set_rc_value(raw: bytearray, field: str, axis: int, value: float):
-    """修改某轴某字段（value 为浮点比例值，如 1.50），写回 bytearray"""
-    raw[RC_FIELD_OFFSETS[field][axis]] = max(0, min(255, round(value * 100)))
-
-
-def bf_rate_curve(stick: float, rc_rate: float, super_rate: float,
-                  expo: float) -> float:
-    """
-    Betaflight 经典 Rates 公式（与固件 fc/rc.c applyBetaflightRates 一致）：
-    摇杆偏转 0~1 → 角速度（°/s）。
-    注意：expo 只弯曲线性部分；满杆拉升系数用的是 expo 之前的原始杆量；
-    rc_rate 超过 2.0 时固件还有额外的线性增益（14.54 倍斜率）。
-    """
-    xe = stick * (1 - expo) + stick ** 3 * expo
-    if rc_rate > 2.0:
-        rc_rate += 14.54 * (rc_rate - 2.0)
-    angle = 200 * rc_rate * xe
-    if super_rate:
-        angle /= max(0.01, 1 - abs(stick) * super_rate)
-    return angle
-
-
-def bf_throttle_curve(x: float, mid: float, expo: float) -> float:
-    """
-    Betaflight 油门曲线（与固件 fc/rc.c lookupThrottleRC 一致）：
-    输入油门 0~1 → 输出 0~1，曲线锚定中点 (mid, mid)，expo 控制弯曲程度。
-    """
-    if mid <= 0 or mid >= 1:
-        mid = 0.5
-    scale = (1 - mid) if x > mid else mid
-    if scale <= 0:
-        return mid
-    t = (x - mid) / scale
-    return mid + t * (1 - expo + expo * t * t) * scale
-
-
-# ------------------------------------------------------------
-# 滤波器配置（MSP_FILTER_CONFIG / MSP_SET_FILTER_CONFIG）
-# ------------------------------------------------------------
-# Betaflight 4.5 的 MSP_FILTER_CONFIG 响应布局（49 字节，与固件 msp.c 一致）。
-# 同样采用 read-modify-write：只改下表列出的字节，其余原样写回。
-#   字段定义：（键名, 中文显示名, 字节偏移, 类型, 最小值, 最大值）
-FILTER_FIELDS = [
-    ("gyro_lpf1_hz",  "陀螺仪低通 1 截止频率 (Hz)", 20, "u16", 0, 1000),
-    ("gyro_lpf2_hz",  "陀螺仪低通 2 截止频率 (Hz)", 22, "u16", 0, 1000),
-    ("dterm_lpf1_hz", "D 项低通 1 截止频率 (Hz)",   1,  "u16", 0, 500),
-    ("dterm_lpf2_hz", "D 项低通 2 截止频率 (Hz)",   26, "u16", 0, 500),
-    ("yaw_lpf_hz",    "偏航低通截止频率 (Hz)",       3,  "u16", 0, 500),
-    ("gyro_notch1_hz",     "陀螺仪陷波 1 频率 (Hz)",  5,  "u16", 0, 1000),
-    ("gyro_notch1_cutoff", "陀螺仪陷波 1 截止 (Hz)",  7,  "u16", 0, 1000),
-    ("dterm_notch_hz",     "D 项陷波频率 (Hz)",       9,  "u16", 0, 500),
-    ("dterm_notch_cutoff", "D 项陷波截止 (Hz)",       11, "u16", 0, 500),
-    ("gyro_notch2_hz",     "陀螺仪陷波 2 频率 (Hz)",  13, "u16", 0, 1000),
-    ("gyro_notch2_cutoff", "陀螺仪陷波 2 截止 (Hz)",  15, "u16", 0, 1000),
-    ("gyro_dyn_min",  "陀螺仪动态低通·下限 (Hz)",   29, "u16", 0, 1000),
-    ("gyro_dyn_max",  "陀螺仪动态低通·上限 (Hz)",   31, "u16", 0, 1000),
-    ("dterm_dyn_min", "D 项动态低通·下限 (Hz)",     33, "u16", 0, 500),
-    ("dterm_dyn_max", "D 项动态低通·上限 (Hz)",     35, "u16", 0, 500),
-    ("notch_q",       "动态陷波 Q 值",              39, "u16", 1, 1000),
-    ("notch_min",     "动态陷波·最低频率 (Hz)",     41, "u16", 0, 1000),
-    ("notch_max",     "动态陷波·最高频率 (Hz)",     45, "u16", 0, 1000),
-    ("notch_count",   "动态陷波·数量",              48, "u8",  0, 5),
-    ("dyn_expo",      "D 项动态低通 expo",          47, "u8",  0, 10),
-    ("rpm_harmonics", "RPM 滤波·谐波数量",          43, "u8",  0, 3),
-    ("rpm_min_hz",    "RPM 滤波·最低频率 (Hz)",     44, "u8",  0, 255),
-]
-
-# 滤波器类型字段（下拉选择）：键名 → 字节偏移
-FILTER_TYPE_FIELDS = {
-    "gyro_lpf1_type": 24, "gyro_lpf2_type": 25,
-    "dterm_lpf1_type": 17, "dterm_lpf2_type": 28,
-}
-FILTER_TYPES = ["PT1", "Biquad", "PT2", "PT3"]
-
-
-def query_filter_config(ser: serial.Serial) -> bytes:
-    """读取滤波器配置原始数据（MSP_FILTER_CONFIG）"""
-    return msp_request(ser, MSP_FILTER_CONFIG)
-
-
-def write_filter_config(ser: serial.Serial, raw: bytes,
-                        save_eeprom: bool = True):
-    """把修改后的滤波器配置写回飞控"""
-    msp_request(ser, MSP_SET_FILTER_CONFIG, bytes(raw))
-    if save_eeprom:
-        msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
-
-
-def parse_filter_config(raw: bytes) -> dict:
-    """把滤波器原始数据解析成 {键名: 整数值}"""
-    if len(raw) < 49:
-        raise MspError(f"滤波器数据长度异常：实际 {len(raw)} 字节（需 49）")
-    result = {}
-    for key, _name, offset, kind, _lo, _hi in FILTER_FIELDS:
-        result[key] = u16(raw, offset) if kind == "u16" else raw[offset]
-    return result
-
-
-def set_filter_value(raw: bytearray, key: str, value: int):
-    """修改某个滤波器字段，写回 bytearray"""
-    for k, _name, offset, kind, lo, hi in FILTER_FIELDS:
-        if k == key:
-            value = max(lo, min(hi, int(value)))
-            if kind == "u16":
-                raw[offset] = value & 0xFF
-                raw[offset + 1] = (value >> 8) & 0xFF
-            else:
-                raw[offset] = value & 0xFF
-            if key == "gyro_lpf1_hz":
-                # 偏移 0 处还有一个旧版单字节副本，保持同步
-                raw[0] = value & 0xFF
-            return
-    raise KeyError(f"未知滤波器字段：{key}")
-
-
-# ------------------------------------------------------------
-# 调参方案（预设）：PID + Rates + 滤波器 整体快照
-# ------------------------------------------------------------
-PRESETS_DIR = PROJECT_ROOT / "presets"
-
-
-def tuning_snapshot(info: dict, pid_names: list, pid_values: list,
-                    rc_raw: bytes, filter_raw: bytes,
-                    name: str = "") -> dict:
-    """把当前全部调参状态打包成一个字典（用于保存预设或写入前备份）"""
-    return {
-        "software": "ApexFlight",
-        "version": "0.5",
-        "name": name,
-        "saved_time": datetime.now().isoformat(timespec="seconds"),
-        "firmware": info.get("firmware", "未知"),
-        "board": info.get("board", "未知"),
-        "pid_names": pid_names,
-        "pid_values": [list(v) for v in pid_values],
-        "rc_tuning_raw": list(rc_raw),
-        "filter_raw": list(filter_raw),
-    }
-
-
-def save_preset_file(directory: Path, filename: str, snapshot: dict) -> Path:
-    """把调参快照保存为 JSON 文件，返回路径"""
-    directory.mkdir(exist_ok=True)
-    path = directory / filename
-    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-    return path
-
-
-def load_preset_file(path: Path) -> dict:
-    """读取预设 JSON 文件"""
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def query_status_ex(ser: serial.Serial) -> dict:
-    """
-    查询扩展状态（MSP_STATUS_EX）：循环时间、CPU 负载、解锁禁用标志。
-    数据格式：循环时间(2) I2C错误(2) 传感器(2) 飞行模式(4) 当前配置(1)
-              CPU负载(2) 解锁禁用标志数量(1) 解锁禁用标志(4) 配置状态(1)
-    """
-    data = msp_request(ser, MSP_STATUS_EX)
-    result = {"cycle_us": 0, "cpu_load": 0, "arming_disabled": []}
-    if len(data) >= 11:
-        result["cycle_us"] = u16(data, 0)
-        result["cpu_load"] = u16(data, 11) if len(data) >= 13 else 0
-        # 解锁禁用标志是 4 字节位图，逐个位翻译成中文原因
-        if len(data) >= 18:
-            flags = (data[14] | (data[15] << 8)
-                     | (data[16] << 16) | (data[17] << 24))
-            for bit, reason in ARMING_DISABLE_FLAGS.items():
-                if flags & (1 << bit):
-                    result["arming_disabled"].append(reason)
-    return result
-
-
-def query_analog(ser: serial.Serial) -> dict:
-    """
-    查询模拟量（MSP_ANALOG）：电压、耗电、RSSI、电流。
-    数据格式：电压(1, 0.1V) 耗电mAh(2) RSSI(2, 0-1023) 电流(2, 0.01A) 电压(2, 0.01V)
-    """
-    data = msp_request(ser, MSP_ANALOG)
-    result = {"voltage": 0.0, "mah": 0, "rssi": 0, "amps": 0.0}
-    if len(data) >= 1:
-        result["voltage"] = data[0] / 10.0    # 老格式，精度低
-    if len(data) >= 3:
-        result["mah"] = u16(data, 1)
-    if len(data) >= 5:
-        result["rssi"] = round(u16(data, 3) / 1023 * 100)  # 转成百分比
-    if len(data) >= 7:
-        result["amps"] = u16(data, 5) / 100.0
-    if len(data) >= 9:
-        result["voltage"] = u16(data, 7) / 100.0  # 新格式，精度高
-    return result
-
-
-def query_attitude(ser: serial.Serial) -> tuple:
-    """
-    查询姿态角（MSP_ATTITUDE）。
-    数据格式：横滚(2, 0.1度) 俯仰(2, 0.1度) 偏航(2, 1度)
-    返回：(roll_deg, pitch_deg, yaw_deg)
-    """
-    data = msp_request(ser, MSP_ATTITUDE)
-    if len(data) < 6:
-        raise MspError("姿态数据长度异常")
-    return s16(data, 0) / 10.0, s16(data, 2) / 10.0, s16(data, 4)
-
-
-def query_rc(ser: serial.Serial) -> list:
-    """查询接收机通道值（MSP_RC），每个通道 2 字节，通常 1000~2000。"""
-    data = msp_request(ser, MSP_RC)
-    return [u16(data, i) for i in range(0, len(data) - 1, 2)]
-
-
-def query_motor_count(ser: serial.Serial) -> int:
-    """查询电机输出通道数量（MSP_MOTOR，每个电机 2 字节）。"""
-    data = msp_request(ser, MSP_MOTOR)
-    return len(data) // 2
-
-
-def set_motors(ser: serial.Serial, values: list):
-    """
-    直接设置电机输出（MSP_SET_MOTOR），电机测试用。
-    参数：values = 8 个 0~2000 的整数（0 表示停转）
-    ⚠️ 危险操作：调用前必须确认已拆下螺旋桨！
-    """
-    payload = bytearray()
-    for v in values:
-        payload += int(v).to_bytes(2, "little")
-    msp_request(ser, MSP_SET_MOTOR, bytes(payload))
-
-
-def query_dataflash_summary(ser: serial.Serial) -> dict:
-    """
-    查询板载闪存信息（MSP_DATAFLASH_SUMMARY，命令码 70）。
-    数据格式：是否支持(1) 扇区数(4) 总容量(4) 已用空间(4)
-    返回：{"supported": bool, "total_mb": float, "used_bytes": int}
-    """
-    data = msp_request(ser, MSP_DATAFLASH_SUMMARY)
-    if len(data) < 13:
-        raise MspError("闪存信息数据长度异常")
-    supported = data[0] != 0
-    used = int.from_bytes(data[9:13], "little")
-    total = int.from_bytes(data[5:9], "little")
-    return {"supported": supported,
-            "total_mb": total / 1048576,
-            "used_bytes": used}
-
-
-def download_dataflash(ser: serial.Serial, used_bytes: int,
-                       start_address: int = 0,
-                       progress_cb=None, cancel_flag=None) -> bytes:
-    """
-    从板载闪存下载黑匣子日志原始数据（MSP_DATAFLASH_READ，命令码 71）。
-    请求格式：起始地址(4字节) + 读取长度(2字节)。
-    响应格式：地址回显(4字节) + 数据。
-
-    参数：used_bytes = 已用字节数（从 summary 获得，即下载终点）
-          start_address = 起始地址（>0 时只下载尾部 = 最新的飞行记录，
-                          因为 Betaflight 的闪存日志是顺序追加写的）
-          progress_cb = 进度回调（已下载字节数）
-          cancel_flag = 可取消标志（带 is_set() 方法的对象，如 threading.Event）
-    返回：下载区间的字节串（.bbl 文件内容，可能从某段日志中间开始，
-          解码器会自动跳过不完整的开头）
-    """
-    if start_address >= used_bytes:
-        raise MspError("下载区间为空")
-    # 首次读取：探测协议版本（v2 大帧 / v1 小帧）与响应头格式
-    probe_len = min(4096, used_bytes - start_address)
-    probe_payload = start_address.to_bytes(4, "little") + probe_len.to_bytes(2, "little")
-    hdr = 4                       # 响应头长度（数据起始偏移），默认老格式
-    try:
-        probe = msp2_request(ser, MSP_DATAFLASH_READ, probe_payload)
-        use_v2, chunk = True, 4096
-    except MspError:
-        probe_len = min(240, used_bytes - start_address)
-        probe_payload = start_address.to_bytes(4, "little") + probe_len.to_bytes(2, "little")
-        probe = msp_request(ser, MSP_DATAFLASH_READ, probe_payload)
-        use_v2, chunk = False, 240
-    if len(probe) >= 7 + probe_len and probe[4:6] == probe_len.to_bytes(2, "little"):
-        if probe[6] != 0:
-            raise MspError("飞控返回了压缩格式的闪存数据，暂不支持解析")
-        hdr = 7                   # BF 4.x 新格式：4+2+1 字节响应头
-    buffer = bytearray(probe[hdr:hdr + probe_len])
-
-    request = msp2_request if use_v2 else msp_request
-    address = start_address + len(buffer)
-    while address < used_bytes:
-        if cancel_flag is not None and cancel_flag.is_set():
-            raise MspError("下载已取消")
-        length = min(chunk, used_bytes - address)
-        payload = address.to_bytes(4, "little") + length.to_bytes(2, "little")
-        data = request(ser, MSP_DATAFLASH_READ, payload)
-        if len(data) < hdr + length:
-            raise MspError("闪存读取响应长度异常")
-        echo = int.from_bytes(data[:4], "little")
-        if echo != address:
-            raise MspError(f"闪存地址不匹配：期望 {address}，实际 {echo}")
-        buffer += data[hdr:hdr + length]
-        address += length
-        if progress_cb and address % 65536 < chunk:   # 每 64KB 报一次进度
-            progress_cb(address - start_address)
-    return bytes(buffer[:used_bytes - start_address])
-
-
-def find_last_log_start(ser: serial.Serial, used_bytes: int,
-                        progress_cb=None, cancel_flag=None) -> int:
-    """
-    从闪存末尾向前搜索最近一次飞行日志的起点地址。
-    黑匣子每段日志以 "H Product:Blackbox" 文本头开头。尾部下载时如果
-    区间内没有段头（说明最近一次飞行很长，跨越了区间边界），解码器
-    将无法识别数据，需要把下载起点扩展到该段头位置。
-    返回：最后一个段头的绝对地址；整片闪存都没有段头时返回 0。
-    """
-    HEADER = b"H Product"
-    STEP = 512 * 1024            # 每块 512KB（读取约 11 秒）
-    OVERLAP = 64                 # 块间重叠，防止段头正好落在块边界上
-    pos = used_bytes
-    while pos > 0:
-        if cancel_flag is not None and cancel_flag.is_set():
-            raise MspError("下载已取消")
-        c0 = max(0, pos - STEP)
-        c1 = min(used_bytes, pos + OVERLAP)
-        if progress_cb:
-            progress_cb(-c0)              # 负数 = 正在扫描定位阶段
-        # MSP 长度字段是 2 字节，单帧最多 65535，分小帧读取本块
-        data = bytearray()
-        addr = c0
-        while addr < c1:
-            length = min(60000, c1 - addr)
-            payload = addr.to_bytes(4, "little") + length.to_bytes(2, "little")
-            data += msp2_request(ser, MSP_DATAFLASH_READ, payload)[7:]
-            addr += length
-        idx = bytes(data).rfind(HEADER)   # 块内最后一个段头
-        if idx >= 0:
-            return c0 + idx
-        pos = c0
-    return 0
-
-
-def erase_dataflash(ser: serial.Serial, timeout: float = 180.0):
-    """
-    清空飞控板载闪存（MSP_DATAFLASH_ERASE，命令码 72）。
-    擦除整颗芯片需要几十秒，飞控在后台异步执行；
-    本函数轮询 summary 直到已用空间归零（超时抛 MspError）。
-    ⚠️ 不可恢复：调用前必须先完成下载！
-    """
-    msp_request(ser, MSP_DATAFLASH_ERASE)         # 触发擦除
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(2)
-        summary = query_dataflash_summary(ser)    # 轮询擦除进度
-        if summary["used_bytes"] == 0:
-            return
-    raise MspError("等待闪存擦除完成超时")
-
-
-# ============================================================
-# 第三部分：PID 备份 / 恢复
-# ============================================================
-
-def save_backup(info: dict, names: list, values: list) -> Path:
-    """
-    把当前 PID 参数备份成 JSON 文件，存到 backups/ 文件夹。
-    文件名带时间戳，方便区分多次备份。返回文件路径。
-    """
-    BACKUP_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = {
-        "software": "ApexFlight",
-        "backup_time": datetime.now().isoformat(timespec="seconds"),
-        "firmware": info.get("firmware", "未知"),
-        "board": info.get("board", "未知"),
-        "pid_names": names,
-        "pid_values": [list(v) for v in values],
-    }
-    path = BACKUP_DIR / f"apex_backup_{timestamp}.json"
-    path.write_text(json.dumps(backup, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-    return path
-
-
-def load_backup(path: Path) -> tuple:
-    """读取备份 JSON 文件，返回 (名称列表, 数值列表)。"""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    names = data["pid_names"]
-    values = [tuple(v) for v in data["pid_values"]]
-    return names, values
-
-
-# ============================================================
-# 第四部分：黑匣子日志分析
-# ============================================================
-# 支持两类文件：
-#   1. .bbl / .bfl 二进制日志 —— 用官方 blackbox_decode.exe 转成 CSV 再解析
-#   2. .csv（blackbox_decode 的输出）—— 直接解析
-# CSV 首行是列名，常见列：
-#   time（微秒）、gyroADC[0..2]（陀螺仪三轴）、setpoint[0..3]（设定值）、
-#   rcCommand[0..3]（遥控器指令）、axisP/I/D[0..2]（PID 各项输出）、
-#   motor[0..7]（电机输出）、vbatLatest（电压）、amperageLatest（电流）
-
-# 通道中文名对照（未列出的通道直接显示原始列名）
-CHANNEL_NAMES = {
-    "gyroADC[0]": "陀螺仪·横滚 (°/s)",
-    "gyroADC[1]": "陀螺仪·俯仰 (°/s)",
-    "gyroADC[2]": "陀螺仪·偏航 (°/s)",
-    "setpoint[0]": "设定值·横滚",
-    "setpoint[1]": "设定值·俯仰",
-    "setpoint[2]": "设定值·偏航",
-    "setpoint[3]": "设定值·油门",
-    "rcCommand[0]": "遥控指令·横滚",
-    "rcCommand[1]": "遥控指令·俯仰",
-    "rcCommand[2]": "遥控指令·偏航",
-    "rcCommand[3]": "遥控指令·油门",
-    "axisP[0]": "P 项·横滚", "axisP[1]": "P 项·俯仰", "axisP[2]": "P 项·偏航",
-    "axisI[0]": "I 项·横滚", "axisI[1]": "I 项·俯仰", "axisI[2]": "I 项·偏航",
-    "axisD[0]": "D 项·横滚", "axisD[1]": "D 项·俯仰", "axisD[2]": "D 项·偏航",
-    "motor[0]": "电机 1 输出", "motor[1]": "电机 2 输出",
-    "motor[2]": "电机 3 输出", "motor[3]": "电机 4 输出",
-    "vbatLatest": "电池电压 (0.01V)",
-    "amperageLatest": "电流 (0.01A)",
-    "rssi": "信号强度 RSSI",
-}
-
-# 通道用途说明（鼠标悬停 / 「通道用途」按钮都会用到）
-CHANNEL_HELP = {
-    "gyroADC[0]": "飞机实际的横滚角速度（°/s）。调参最核心的通道：和设定值对比看"
-                  "跟踪效果；波形毛刺多 = 滤波不够，来回振荡 = P/D 过高。",
-    "gyroADC[1]": "飞机实际的俯仰角速度（°/s）。用途同横滚：看响应是否跟手、"
-                  "有没有振动噪声。",
-    "gyroADC[2]": "飞机实际的偏航角速度（°/s）。偏航振荡常见于机架共振或"
-                  "偏航 PID 过激。",
-    "setpoint[0]": "飞控根据打杆算出的横滚目标角速度。和 gyroADC[0] 对比："
-                   "滞后大 → 可加 P 或 FeedForward；超调多 → 加 D 或减 P。",
-    "setpoint[1]": "俯仰目标角速度，用途同上。",
-    "setpoint[2]": "偏航目标角速度，用途同上。",
-    "setpoint[3]": "目标油门。看油门突变时其他通道是否被干扰（掉压导致抖动）。",
-    "rcCommand[0]": "遥控器横滚原始指令。排查打杆没反应、通道反向、"
-                    "接收机信号抖动时用。",
-    "rcCommand[1]": "遥控器俯仰原始指令，用途同上。",
-    "rcCommand[2]": "遥控器偏航原始指令，用途同上。",
-    "rcCommand[3]": "遥控器油门原始指令，用途同上。",
-    "axisP[0]": "P 项（比例）横滚输出。波形高频振荡 → P 太高；"
-                "跟踪缓慢无力 → P 偏低。",
-    "axisP[1]": "P 项俯仰输出，用途同上。",
-    "axisP[2]": "P 项偏航输出，用途同上。",
-    "axisI[0]": "I 项（积分）横滚输出，负责消除持续误差（风阻、重心偏移）。"
-                "长期偏离零属正常；机身缓慢来回摆动 → I 太高。",
-    "axisI[1]": "I 项俯仰输出，用途同上。",
-    "axisI[2]": "I 项偏航输出，用途同上。",
-    "axisD[0]": "D 项（微分）横滚输出，抑制过冲和回弹。D 太大 → 电机发热、"
-                "放大高频噪声；洗桨（急转后抖动）明显 → 可适当加 D。",
-    "axisD[1]": "D 项俯仰输出，用途同上。",
-    "axisD[2]": "D 项偏航输出，用途同上。",
-    "motor[0]": "电机 1 输出（1000~2000）。长期贴顶（≈2000 饱和）→ 重心偏、"
-                "机架损伤或该轴 PID 过激；几个电机差值大 → 机架不对称。",
-    "motor[1]": "电机 2 输出，用途同上。",
-    "motor[2]": "电机 3 输出，用途同上。",
-    "motor[3]": "电机 4 输出，用途同上。",
-    "vbatLatest": "电池电压。满油门时掉压厉害 → 电池老化或放电倍率不够；"
-                  "松油门后回升缓慢 → 内阻偏大。",
-    "amperageLatest": "瞬时电流。看功耗峰值、排查异常耗电。",
-    "rssi": "链路信号强度（0~99 或百分比）。定位失控、信号弱发生在什么时间。",
-}
-CHANNEL_HELP_DEFAULT = ("该通道的详细含义可对照 Betaflight 黑匣子文档。"
-                        "一般来说： gyro 类看噪声与跟踪，setpoint/rcCommand 类"
-                        "看输入，axisP/I/D 类看 PID 各项出力，motor 类看饱和。")
-
-
-class BlackboxError(Exception):
-    """黑匣子日志处理错误"""
-    pass
-
-
-def decode_blackbox(log_path: Path) -> list:
-    """
-    用官方 blackbox_decode.exe 把 .bbl/.bfl 二进制日志解码成 CSV。
-    一个 .bbl 文件通常包含多段飞行记录（每次解锁一段），
-    解码器会生成 "文件名.01.csv"、"文件名.02.csv"……
-    返回：全部生成的 CSV 路径列表（按段号排序）。
-    """
-    if not BLACKBOX_DECODER.exists():
-        raise BlackboxError(f"未找到解码器：{BLACKBOX_DECODER}")
-    before = set(log_path.parent.glob("*.csv"))
-    result = subprocess.run(
-        [str(BLACKBOX_DECODER), str(log_path)],
-        cwd=str(BLACKBOX_DECODER.parent),     # DLL 在 tools 目录里
-        capture_output=True, timeout=300,
-    )
-    if result.returncode != 0:
-        raise BlackboxError(
-            f"解码失败（可能不是有效的黑匣子日志）：\n"
-            f"{result.stderr.decode('gbk', errors='replace')[:300]}")
-    new_csvs = sorted(set(log_path.parent.glob("*.csv")) - before)
-    if not new_csvs:
-        raise BlackboxError("解码器没有产出 CSV 文件")
-    return new_csvs
-
-
-def parse_bbl_header(log_path: Path) -> dict:
-    """
-    直接解析 .bbl/.bfl 文件的头部信息（头部是纯文本行，以 "H " 开头）。
-    返回关键信息字典：固件版本、机名、板子、循环频率、日期等。
-    解析不到时返回空字典（例如直接打开 CSV 的情况）。
-    """
-    info = {}
-    # 我们关心的头部字段 -> 中文显示名
-    wanted = {
-        "Firmware type": "固件类型",
-        "Firmware revision": "固件版本",
-        "Firmware date": "固件日期",
-        "Craft name": "机名",
-        "Board information": "板子信息",
-        "looptime": "PID 循环周期 (µs)",
-        "gyro_scale": "陀螺仪量程",
-        "acc_1G": "加速度计 1G 值",
-        "vbatref": "电压基准",
-        "currentMeter": "电流计",
-        "motorOutput": "电机输出范围",
-        "rc_rate": "RC 速率",
-        "rc_expo": "RC  expo",
-        "rates": " Rates",
-        "rollPID": "Roll PID",
-        "pitchPID": "Pitch PID",
-        "yawPID": "Yaw PID",
-        "dterm_filter_type": "D 项滤波类型",
-        "gyro_lowpass_hz": "陀螺仪低通 (Hz)",
-        "dterm_lowpass_hz": "D 项低通 (Hz)",
-    }
-    try:
-        # 头部在文件开头，读前 64KB 足够
-        with open(log_path, "rb") as f:
-            raw = f.read(65536)
-        text = raw.decode("latin-1", errors="replace")
-        for line in text.split("\n"):
-            line = line.strip("\x00").strip()
-            if not line.startswith("H "):
-                continue
-            body = line[2:]
-            if ":" not in body:
-                continue
-            key, _, value = body.partition(":")
-            key, value = key.strip(), value.strip()
-            if key in wanted and key not in info:
-                info[key] = value
-    except OSError:
-        pass
-    # 转换成 {中文名: 值} 返回，保持 wanted 中的顺序
-    return {wanted[k]: v for k, v in info.items() if k in wanted}
-
-
-def load_blackbox_csv(csv_path: Path) -> tuple:
-    """
-    读取黑匣子 CSV 文件。
-    返回：(时间轴[秒] 列表, {列名: 数值列表}, 原始列名列表)
-    大文件自动抽稀到约 10 万点：绘图流畅，同时保留足够采样率做频谱分析。
-    """
-    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-        reader = csv.reader(f)
-        # blackbox_decode 生成的表头形如 "loopIteration, time (us), axisP[0], ..."
-        # 列名带前导空格，且时间列叫 "time (us)" 而不是 "time"，
-        # 这里统一去掉空格，并兼容两种时间列名
-        header = [name.strip() for name in next(reader)]
-        columns = {name: [] for name in header}
-        for row in reader:
-            for name, cell in zip(header, row):
-                try:
-                    columns[name].append(float(cell))
-                except ValueError:
-                    columns[name].append(float("nan"))
-
-    time_name = next((n for n in columns if n.lower().startswith("time")), None)
-    if time_name is None or not columns[time_name]:
-        raise BlackboxError("CSV 中没有 time 列，不是标准的黑匣子日志")
-    time_col = columns[time_name]
-
-    count = len(time_col)
-    stride = max(1, count // 100000)
-    time_axis = [t / 1_000_000 for t in time_col[::stride]]   # 微秒 → 秒
-    data = {name: vals[::stride] for name, vals in columns.items()
-            if name != time_name}
-    kept = [name for name in header if name != time_name]
-    return time_axis, data, kept
-
-
-def generate_demo_log() -> Path:
-    """
-    生成一段 10 秒的演示日志（CSV 格式），让没有黑匣子日志的
-    用户也能立即体验曲线分析功能。内容模拟一次翻滚动作。
-    """
-    import math
-    import random
-
-    LOGS_DIR.mkdir(exist_ok=True)
-    path = LOGS_DIR / "demo_flight.csv"
-    random.seed(42)
-    header = ["time", "gyroADC[0]", "gyroADC[1]", "gyroADC[2]",
-              "setpoint[0]", "setpoint[1]", "setpoint[2]",
-              "motor[0]", "motor[1]", "motor[2]", "motor[3]",
-              "vbatLatest"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        for i in range(5000):                 # 10 秒 × 500Hz
-            t_us = i * 2000
-            t = t_us / 1_000_000
-            # 3~4 秒时打一次满杆横滚（设定值阶跃 + 陀螺仪跟随响应）
-            sp = 500 if 3.0 <= t < 4.0 else 0
-            gyro = sp * (1 - math.exp(-max(0, t - 3.0) * 8)) \
-                if t >= 3.0 else 0
-            if t >= 4.0:
-                gyro = 500 * math.exp(-(t - 4.0) * 8)
-            gyro += random.gauss(0, 25)       # 叠加噪声（模拟真实陀螺仪）
-            writer.writerow([
-                t_us,
-                round(gyro, 1),               # gyroADC[0] 横滚
-                round(random.gauss(0, 15), 1),
-                round(random.gauss(0, 15), 1),
-                sp, 0, 0,                     # setpoint
-                round(1400 + sp * 0.4 + random.gauss(0, 30)),   # motor 1
-                round(1400 + sp * 0.4 + random.gauss(0, 30)),   # motor 2
-                round(1400 - sp * 0.4 + random.gauss(0, 30)),   # motor 3
-                round(1400 - sp * 0.4 + random.gauss(0, 30)),   # motor 4
-                1680 - int(t * 2),            # 电压缓降
-            ])
-    return path
-
-
-def analyze_blackbox_stats(time_axis: list, data: dict, columns: list) -> dict:
-    """
-    黑匣子结构化分析（v0.6）：把日志算成一组有调参意义的指标，
-    供「AI 调参建议」和「AI 解读图表」使用。
-    返回指标字典：时长/采样率、各轴陀螺仪 RMS 噪声与 FFT 主峰、
-    设定值→陀螺仪跟踪滞后（互相关）、电机饱和占比、最低电压。
-    """
-    import numpy as np
-
-    stats = {}
-    if not time_axis:
-        return stats
-    stats["时长(秒)"] = round(time_axis[-1], 1)
-    t = np.array(time_axis)
-    dt = float(np.median(np.diff(t))) if len(t) > 1 else 0
-    stats["采样率(Hz)"] = round(1 / dt) if dt > 0 else 0
-
-    def arr(name):
-        return np.array(data.get(name, []), dtype=float)
-
-    axis_names = {0: "横滚", 1: "俯仰", 2: "偏航"}
-    # ---- 各轴陀螺仪：RMS 噪声 + 前 3 个频谱峰 ----
-    for axis in range(3):
-        name = f"gyroADC[{axis}]"
-        if name not in data or dt <= 0:
-            continue
-        y = arr(name)
-        y = y[~np.isnan(y)]
-        if len(y) < 64:
-            continue
-        y = y - y.mean()
-        rms = float(np.sqrt(np.mean(y * y)))
-        windowed = y * np.hanning(len(y))
-        spec = np.abs(np.fft.rfft(windowed)) / len(y) * 2
-        freqs = np.fft.rfftfreq(len(y), dt)
-        mask = freqs > 20                       # 忽略机身运动频率
-        peaks = []
-        if mask.any():
-            vf, vs = freqs[mask], spec[mask]
-            top = np.argsort(vs)[-3:]
-            peaks = sorted(round(float(vf[i])) for i in top)
-        stats[f"陀螺仪·{axis_names[axis]} RMS噪声(°/s)"] = round(rms, 1)
-        stats[f"陀螺仪·{axis_names[axis]} 噪声峰(Hz)"] = peaks
-
-    # ---- 跟踪质量：setpoint → gyro 的互相关滞后（正 = 陀螺仪慢）----
-    for axis in range(3):
-        sp, gy = f"setpoint[{axis}]", f"gyroADC[{axis}]"
-        if sp not in data or gy not in data or dt <= 0:
-            continue
-        s, g = arr(sp), arr(gy)
-        n = min(len(s), len(g))
-        s = np.nan_to_num(s[:n] - np.nanmean(s[:n]))
-        g = np.nan_to_num(g[:n] - np.nanmean(g[:n]))
-        if np.std(s) < 1e-6 or np.std(g) < 1e-6:
-            continue
-        corr = np.correlate(g, s, mode="full")
-        lag = int(np.argmax(corr) - (n - 1))
-        stats[f"跟踪滞后·{axis_names[axis]}(ms)"] = round(lag * dt * 1000, 1)
-
-    # ---- 电机饱和（输出 >1950 的时间占比，取最高的一只电机）----
-    motors = [c for c in columns if c.startswith("motor[")]
-    sat = []
-    for mn in motors:
-        mv = arr(mn)
-        mv = mv[~np.isnan(mv)]
-        if len(mv):
-            sat.append(float(np.mean(mv > 1950) * 100))
-    if sat:
-        stats["电机饱和时间占比(%)"] = round(max(sat), 1)
-
-    # ---- 电压（vbatLatest 单位 0.01V）----
-    if "vbatLatest" in data:
-        v = arr("vbatLatest") / 100.0
-        v = v[~np.isnan(v)]
-        if len(v):
-            stats["最低电压(V)"] = round(float(v.min()), 2)
-    return stats
+# 同目录下的功能模块（src/ 已在 sys.path 中，直接 import）
+from apex_msp import *       # noqa: F401,F403  MSP 协议
+from apex_fc import *        # noqa: F401,F403  飞控查询/写入/备份/快照
+from apex_blackbox import *  # noqa: F401,F403  黑匣子分析
+from apex_ai import *        # noqa: F401,F403  AI 助手
+from apex_widgets import *   # noqa: F401,F403  自定义控件
 
 # ============================================================
 # 第五部分：后台工作线程（防止界面卡死）
@@ -1567,199 +448,6 @@ class SerialWorker(QObject):
     @property
     def is_connected(self) -> bool:
         return self.serial_port is not None and self.serial_port.is_open
-
-
-# ============================================================
-# 第五部分（B）：AI 助手 —— Ollama 本地大模型通信
-# ============================================================
-# 使用 Ollama 的 HTTP API（http://localhost:11434）与本地大模型对话。
-# 只用 Python 标准库 urllib，不需要额外安装依赖。
-# 所有网络请求都在后台线程执行（由 MainWindow._run_in_thread 驱动），
-# 通过 pyqtSignal 把流式生成的文字安全地送回界面线程。
-
-OLLAMA_BASE_URL = "http://localhost:11434"
-AI_RECOMMENDED_MODELS = ["qwen2.5:3b", "qwen2.5:1.5b"]   # v0.6 主推 3b 深度分析
-
-AI_SYSTEM_PROMPT = (
-    "你是 ApexFlight 内置的无人机调参专家助手，精通 Betaflight 固件、"
-    "PID 调参、Rates/滤波设置和黑匣子日志分析。"
-    "请始终使用简体中文回答，语言简洁、给出可操作建议。"
-    "分析数据时请按这个结构回答：①总体状态判断 ②按优先级排列的具体修改建议"
-    "（改哪项、建议改成多少、依据是什么）③需要提醒的风险。"
-    "涉及电机测试、参数修改等操作时，务必先提醒用户卸下螺旋桨、注意人身安全。"
-)
-
-
-def ollama_status() -> tuple[bool, list]:
-    """检测 Ollama 服务是否运行，返回 (是否运行, 已安装模型名列表)"""
-    try:
-        req = urllib.request.Request(OLLAMA_BASE_URL + "/api/tags")
-        with urllib.request.urlopen(req, timeout=1) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        models = [m.get("name", "") for m in data.get("models", [])]
-        return True, models
-    except Exception:
-        return False, []
-
-
-class AIBridge(QObject):
-    """AI 对话桥：在后台线程调用 Ollama，流式输出通过信号送回界面"""
-
-    token = pyqtSignal(str)      # 每收到一小段生成文字就发一次
-    done = pyqtSignal()          # 一轮回答完整结束
-    failed = pyqtSignal(str)     # 调用失败（服务没开/模型不存在/网络错误）
-
-    def __init__(self):
-        super().__init__()
-        self._cancel = threading.Event()
-
-    def cancel(self):
-        """请求中断当前回答（由界面线程调用，线程安全）"""
-        self._cancel.set()
-
-    def chat(self, model: str, messages: list):
-        """
-        阻塞式流式对话（必须在后台线程调用）。
-        messages: [{"role": "system"/"user"/"assistant", "content": "..."}, ...]
-        """
-        self._cancel.clear()
-        body = json.dumps({
-            "model": model,
-            "messages": messages,
-            "stream": True,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            OLLAMA_BASE_URL + "/api/chat", data=body,
-            headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                # 响应是逐行的 JSON 流，每行形如：
-                # {"message":{"role":"assistant","content":"文字片段"},"done":false}
-                for raw_line in resp:
-                    if self._cancel.is_set():
-                        break
-                    line = raw_line.decode("utf-8", "ignore").strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    piece = chunk.get("message", {}).get("content", "")
-                    if piece:
-                        self.token.emit(piece)
-                    if chunk.get("done"):
-                        break
-            self.done.emit()
-        except urllib.error.URLError as e:
-            self.failed.emit(
-                f"无法连接 Ollama 服务：{e}\n请确认 Ollama 已启动。")
-        except Exception as e:
-            self.failed.emit(f"AI 调用失败：{e}")
-
-
-# ============================================================
-# 第五部分：自定义控件
-# ============================================================
-
-class ToggleSwitch(QAbstractButton):
-    """
-    胶囊开关（仿 Betaflight Configurator 的 toggle 样式）：
-    关 = 灰色胶囊 + 白色圆点在左；开 = 橙色胶囊 + 白色圆点在右。
-    用法和 QCheckBox 一样：isChecked() / setChecked() / toggled 信号。
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCheckable(True)
-        self.setFixedSize(38, 20)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect().adjusted(1, 1, -1, -1)
-        on = self.isChecked()
-
-        # 胶囊背景（开 = 图标橙，关 = 深灰）
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(245, 168, 61) if on else QColor(54, 60, 68))
-        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
-
-        # 白色圆形滑块
-        d = rect.height() - 4
-        x = rect.right() - d - 2 if on else rect.left() + 2
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(int(x), int(rect.top() + 2), int(d), int(d))
-        painter.end()
-
-    def sizeHint(self):
-        return self.minimumSizeHint()
-
-
-class AttitudeIndicator(QWidget):
-    """
-    人工地平线仪表：模拟真实飞行仪表，显示横滚和俯仰。
-    蓝色 = 天空，棕色 = 地面，中间的线 = 地平线。
-    """
-
-    def __init__(self):
-        super().__init__()
-        self._roll = 0.0
-        self._pitch = 0.0
-        self.setMinimumSize(180, 180)
-
-    def set_attitude(self, roll: float, pitch: float):
-        """更新姿态角（单位：度）并重绘"""
-        self._roll, self._pitch = roll, pitch
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        size = int(min(self.width(), self.height()))
-        painter.translate(self.width() / 2, self.height() / 2)
-
-        # 圆形裁剪，画出仪表外形
-        # 注意 1：QPainter 没有 setClipEllipse 方法（Qt4 老 API），
-        #         Qt6 必须用 QPainterPath + setClipPath 实现椭圆裁剪
-        # 注意 2：fillRect 等只接受整数坐标，浮点数会抛 TypeError
-        radius = int(size / 2 - 4)
-        clip_path = QPainterPath()
-        clip_path.addEllipse(-radius, -radius, radius * 2, radius * 2)
-        painter.setClipPath(clip_path)
-
-        # 按横滚角旋转、按俯仰角上下平移整个天地
-        # Betaflight 的角度约定与航空仪表相反：
-        #   俯仰值为正 = 机头下压 → 应看到更多地面 → 地平线上移（取负号）
-        #   横滚旋转方向同理取反，与 Configurator 的 3D 模型保持一致
-        painter.save()
-        painter.rotate(self._roll)
-        pitch_pixels = int(max(-radius, min(radius, -self._pitch * 2)))
-
-        # 天/地配色与 ApexFlight 图标一致：青色天空 + 深棕地面
-        painter.fillRect(-size, -size * 2 + pitch_pixels,
-                         size * 2, size * 2, QColor(62, 198, 232))   # 天空
-        painter.fillRect(-size, pitch_pixels,
-                         size * 2, size * 2, QColor(74, 56, 38))     # 地面
-        # 地平线
-        painter.setPen(QPen(QColor(255, 255, 255), 2))
-        painter.drawLine(-size, int(pitch_pixels), size, int(pitch_pixels))
-        painter.restore()
-
-        # 中央固定的飞机符号（图标橙色，不随姿态转动）
-        painter.setPen(QPen(QColor(245, 168, 61), 4))
-        painter.drawLine(-30, 0, -10, 0)
-        painter.drawLine(10, 0, 30, 0)
-        painter.drawLine(0, 0, 0, 6)
-
-        # 外圈边框
-        painter.setClipping(False)
-        painter.setPen(QPen(QColor(120, 120, 120), 2))
-        painter.drawEllipse(int(-radius), int(-radius),
-                            int(radius * 2), int(radius * 2))
-        painter.end()
 
 
 # ============================================================
@@ -2382,6 +1070,24 @@ class MainWindow(QMainWindow):
         self.bb_ai_btn.setEnabled(False)
         left.addWidget(self.bb_ai_btn)
 
+        # v0.7：双日志对比（调参前/后效果叠加）
+        compare_box = QGroupBox("双日志对比")
+        compare_form = QVBoxLayout(compare_box)
+        self.bb_compare_btn = QPushButton("📂 加载对比日志")
+        self.bb_compare_btn.setToolTip(
+            "加载第二段日志（如调参前的飞行），与当前日志同图对比")
+        self.bb_compare_btn.clicked.connect(self.on_bb_open_compare)
+        compare_form.addWidget(self.bb_compare_btn)
+        self.bb_compare = QCheckBox("对比模式（当前 vs 对比日志）")
+        self.bb_compare.setEnabled(False)
+        self.bb_compare.stateChanged.connect(lambda _s: self.on_bb_plot())
+        compare_form.addWidget(self.bb_compare)
+        self.bb_compare_label = QLabel("未加载对比日志")
+        self.bb_compare_label.setWordWrap(True)
+        self.bb_compare_label.setStyleSheet("color: #9AA0A6;")
+        compare_form.addWidget(self.bb_compare_label)
+        left.addWidget(compare_box)
+
         # 游标读数
         self.bb_cursor_label = QLabel("移动鼠标到图上查看数值")
         self.bb_cursor_label.setWordWrap(True)
@@ -2415,9 +1121,15 @@ class MainWindow(QMainWindow):
         self.bb_columns = []
         self.bb_sessions = []             # 多段日志的 CSV 路径
         self.bb_header_info = {}          # .bbl 头部信息
+        self.bb_log_type = {}             # 日志类型判别结果（飞行/空转）
         self.bb_axes = []                 # 当前图中的子图
         self.bb_cursor_lines = []         # 游标竖线
         self.bb_plotted = []              # [(列名, 数值, 显示名)]，游标读数用
+        # v0.7：对比日志（第二段日志，调参前/后对比用）
+        self.bb2_time = []
+        self.bb2_data = {}
+        self.bb2_columns = []
+        self.bb2_name = ""
         return tab
 
     # ---------- 黑匣子：文件加载 ----------
@@ -2577,10 +1289,27 @@ class MainWindow(QMainWindow):
         # 默认打开前两个通道
         for col in self.bb_columns[:2]:
             self.bb_toggles[col].setChecked(True)
+        # v0.7：自动判别日志类型（真实飞行 / 地面空转）
+        try:
+            self.bb_log_type = classify_log_type(
+                self.bb_time, self.bb_data, self.bb_columns)
+            verdict = self.bb_log_type["verdict"]
+            conf = self.bb_log_type["confidence"]
+            self.bb_stats_label.setText(
+                f"📋 日志判别：{verdict}（置信度 {conf}%）\n"
+                + "\n".join("· " + r for r in self.bb_log_type["reasons"]))
+            if "空转" in verdict or "静止" in verdict:
+                self.statusBar().showMessage(
+                    f"注意：这段日志{verdict}，调参参考价值有限")
+        except Exception:
+            self.bb_log_type = {}
+
         self.bb_plot_btn.setEnabled(True)
         self.bb_fft_btn.setEnabled(True)
         self.bb_ai_btn.setEnabled(True)
-        self.statusBar().showMessage("日志加载完成，点击「绘制曲线」")
+        if "空转" not in self.bb_log_type.get("verdict", "") \
+                and "静止" not in self.bb_log_type.get("verdict", ""):
+            self.statusBar().showMessage("日志加载完成，点击「绘制曲线」")
         self.on_bb_plot()
 
     # ---------- 黑匣子：数据切片 ----------
@@ -2665,6 +1394,24 @@ class MainWindow(QMainWindow):
                 values = [v / peak for v in values]
             display = CHANNEL_NAMES.get(col, col)
             ax.plot(t, values, linewidth=0.8, color="#3EC6E8")
+
+            # v0.7：对比模式——叠加第二段日志的同名通道（橙色）
+            comparing = (self.bb_compare.isChecked() and self.bb2_time
+                         and col in self.bb2_data)
+            if comparing:
+                t2, values2 = self._bb_slice(self.bb2_data[col])
+                if normalize:
+                    peak2 = max(abs(min(values2)), abs(max(values2)), 1e-9)
+                    values2 = [v / peak2 for v in values2]
+                ax.plot(t2, values2, linewidth=0.8, color="#F5A83D",
+                        alpha=0.9)
+                if row == 0:
+                    ax.plot([], [], color="#3EC6E8", label="当前日志")
+                    ax.plot([], [], color="#F5A83D",
+                            label=f"对比：{self.bb2_name}")
+                    ax.legend(loc="upper right", fontsize=8,
+                              facecolor="#23272E", labelcolor="#E8E8E8")
+
             ax.set_ylabel(display, color="#E8E8E8", fontsize=9)
             ax.grid(True, alpha=0.2, color="#9AA0A6")
             ax.tick_params(colors="#9AA0A6", labelsize=8)
@@ -2676,9 +1423,14 @@ class MainWindow(QMainWindow):
             self.bb_cursor_lines.append(vline)
             self.bb_axes.append(ax)
             self.bb_plotted.append((col, values, display))
-            stats_lines.append(
-                f"{display}：均值 {sum(values)/len(values):.1f}，"
-                f"范围 {min(values):.0f} ~ {max(values):.0f}")
+            if comparing:
+                stats_lines.append(
+                    f"{display}：当前均值 {sum(values)/len(values):.1f} ｜ "
+                    f"对比 {sum(values2)/len(values2):.1f}")
+            else:
+                stats_lines.append(
+                    f"{display}：均值 {sum(values)/len(values):.1f}，"
+                    f"范围 {min(values):.0f} ~ {max(values):.0f}")
 
         self.bb_axes[-1].set_xlabel("时间 (秒)", color="#E8E8E8")
         title = "归一化对比" if normalize else "黑匣子数据轨道"
@@ -2711,6 +1463,35 @@ class MainWindow(QMainWindow):
         self.bb_cursor_label.setText("\n".join(parts))
         self.bb_canvas.draw_idle()
 
+    def on_bb_open_compare(self):
+        """加载对比日志（v0.7）：第二段日志与当前日志同图叠加对比"""
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "选择对比日志（如调参前的飞行）", str(LOGS_DIR),
+            "黑匣子日志 (*.bbl *.bfl *.csv);;所有文件 (*)")
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            if path.suffix.lower() in (".bbl", ".bfl"):
+                self.statusBar().showMessage("正在解码对比日志……")
+                csvs = decode_blackbox(path)
+                path = csvs[0]                # 对比用第一段即可
+            self.bb2_time, self.bb2_data, self.bb2_columns = \
+                load_blackbox_csv(path)
+            self.bb2_name = path.name
+            self.bb_compare_label.setText(
+                f"对比日志：{self.bb2_name}"
+                f"（{self.bb2_time[-1]:.1f} 秒）")
+            self.bb_compare.setEnabled(True)
+            self.bb_compare.setChecked(True)
+            self.on_bb_plot()
+            self.statusBar().showMessage(
+                "对比日志已加载：青色 = 当前，橙色 = 对比")
+        except BlackboxError as e:
+            self.on_error(str(e))
+        except Exception as e:
+            self.on_error(f"对比日志读取失败：{e}")
+
     def on_bb_ask_ai(self):
         """把当前日志的结构化分析发给 AI 解读，自动切到 AI 页看回答"""
         if not self.bb_time:
@@ -2723,13 +1504,35 @@ class MainWindow(QMainWindow):
             return
         selected = [CHANNEL_NAMES.get(c, c)
                     for c in self._bb_selected_channels()]
-        prompt = (
-            "请解读这段穿越机黑匣子日志的结构化分析结果，"
-            "指出飞机的状态问题并给出调参方向"
-            "（噪声峰→滤波器设置，跟踪滞后→PID/FeedForward，"
-            "电机饱和→机架/重心，掉压→电池）：\n"
-            f"我正在查看的通道：{'、'.join(selected) if selected else '（未选择）'}\n"
-            + "\n".join(f"{k}：{v}" for k, v in stats.items()))
+        comparing = (self.bb_compare.isChecked() and self.bb2_time)
+        if comparing:
+            stats2 = analyze_blackbox_stats(
+                self.bb2_time, self.bb2_data, self.bb2_columns)
+            prompt = (
+                "请对比这两段穿越机黑匣子日志的结构化分析"
+                "（通常是调参前 vs 调参后），判断哪段整体更好、"
+                "具体好在哪些指标（噪声 RMS、噪声峰位置、跟踪滞后、"
+                "电机饱和、电压），并给出下一步调参建议：\n"
+                f"【当前日志】\n" + "\n".join(
+                    f"{k}：{v}" for k, v in stats.items())
+                + f"\n\n【对比日志 {self.bb2_name}】\n" + "\n".join(
+                    f"{k}：{v}" for k, v in stats2.items()))
+        else:
+            prompt = (
+                "请解读这段穿越机黑匣子日志的分析结果。先判断日志类型结论"
+                "（正常飞行还是地面通电空转）是否可信、说明依据；"
+                "如果是真实飞行，再指出飞机状态问题并给出调参方向"
+                "（噪声峰→滤波器设置，跟踪滞后→PID/FeedForward，"
+                "电机饱和→机架/重心，掉压→电池）；"
+                "如果是地面空转，请说明这类数据能用来验证什么、"
+                "不能用来调什么。\n"
+                f"日志类型判别：{self.bb_log_type.get('verdict', '未知')}"
+                f"（置信度 {self.bb_log_type.get('confidence', 0)}%）\n"
+                + "\n".join("· " + r for r in
+                            self.bb_log_type.get("reasons", []))
+                + f"\n我正在查看的通道："
+                  f"{'、'.join(selected) if selected else '（未选择）'}\n"
+                + "\n".join(f"{k}：{v}" for k, v in stats.items()))
         self.sidebar.setCurrentRow(8)         # 切到 AI 助手页
         self._ai_ask(prompt)
 
@@ -3570,8 +2373,14 @@ class MainWindow(QMainWindow):
             stats = analyze_blackbox_stats(
                 self.bb_time, self.bb_data, self.bb_columns)
             if stats:
-                parts.append("【黑匣子分析】\n" + "\n".join(
-                    f"{k}：{v}" for k, v in stats.items()))
+                block = "【黑匣子分析】\n" + "\n".join(
+                    f"{k}：{v}" for k, v in stats.items())
+                if self.bb_log_type:
+                    block += (f"\n日志类型判别：{self.bb_log_type['verdict']}"
+                              f"（置信度 {self.bb_log_type['confidence']}%）\n"
+                              + "\n".join("· " + r for r in
+                                          self.bb_log_type["reasons"]))
+                parts.append(block)
         return "\n\n".join(parts)
 
     def on_ai_tuning_advice(self):

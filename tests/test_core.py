@@ -165,6 +165,54 @@ def test_preset_snapshot_roundtrip(tmp: Path = None):
     path.unlink()
 
 
+def test_classify_log_type():
+    """飞行/地面空转日志判别"""
+    n = 500
+    time_axis = [i * 2000 for i in range(n)]  # 500Hz, 1 秒
+
+    # 地面空转：电机恒定 1400、电流 1.5A、陀螺仪小噪声、设定点全 0
+    ground = {
+        "motor[0]": [1400] * n, "motor[1]": [1400] * n,
+        "amperageLatest": [150] * n,  # 0.01A 单位 → 1.5A
+        "gyroADC[0]": [5 * ((i % 7) - 3) for i in range(n)],
+        "gyroADC[1]": [3 * ((i % 5) - 2) for i in range(n)],
+        "setpoint[0]": [0] * n, "setpoint[1]": [0] * n, "setpoint[2]": [0] * n,
+    }
+    r = m.classify_log_type(time_axis, ground,
+                            ["motor[0]", "motor[1]", "amperageLatest",
+                             "gyroADC[0]", "gyroADC[1]",
+                             "setpoint[0]", "setpoint[1]", "setpoint[2]"])
+    assert "空转" in r["verdict"] or "静止" in r["verdict"], r
+    assert r["confidence"] >= 60
+    assert r["features"]["平均电流(A)"] < 3
+
+    # 正常飞行：电流 15A、陀螺仪大幅活动、设定点持续变化
+    import math as _math
+    flight = {
+        "motor[0]": [1500 + int(200 * _math.sin(i / 8)) for i in range(n)],
+        "motor[1]": [1450 + int(180 * _math.cos(i / 9)) for i in range(n)],
+        "amperageLatest": [1500 + 100 * (i % 4) for i in range(n)],  # ~15A
+        "gyroADC[0]": [int(300 * _math.sin(i / 5)) for i in range(n)],
+        "gyroADC[1]": [int(250 * _math.cos(i / 6)) for i in range(n)],
+        "setpoint[0]": [int(200 * _math.sin(i / 7)) for i in range(n)],
+        "setpoint[1]": [int(150 * _math.cos(i / 8)) for i in range(n)],
+        "setpoint[2]": [30] * n,
+    }
+    r2 = m.classify_log_type(time_axis, flight,
+                             ["motor[0]", "motor[1]", "amperageLatest",
+                              "gyroADC[0]", "gyroADC[1]",
+                              "setpoint[0]", "setpoint[1]", "setpoint[2]"])
+    assert "正常飞行" in r2["verdict"], r2
+    assert r2["confidence"] >= 60
+    assert r2["features"]["平均电流(A)"] > 10
+
+    # 列缺失时（无电流、无电机）不应抛异常
+    r3 = m.classify_log_type(time_axis,
+                             {"gyroADC[0]": [0] * n, "setpoint[0]": [0] * n},
+                             ["gyroADC[0]", "setpoint[0]"])
+    assert r3["verdict"]
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in list(globals().items())
              if name.startswith("test_") and callable(fn)]

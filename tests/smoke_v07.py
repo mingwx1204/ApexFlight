@@ -1,0 +1,90 @@
+# -*- coding: utf-8 -*-
+"""v0.7 离屏冒烟测试：主窗口 + 黑匣子判别 + 双日志对比 + 全部页面渲染"""
+import os
+import sys
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from PyQt6.QtWidgets import QApplication
+import main as m
+
+OUT = os.path.join(os.path.dirname(__file__), "..", "logs", "smoke")
+os.makedirs(OUT, exist_ok=True)
+
+app = QApplication([])
+win = m.MainWindow()
+win.resize(1440, 900)
+win.show()
+app.processEvents()
+
+failed = 0
+
+
+def check(name, cond, detail=""):
+    global failed
+    if cond:
+        print(f"  ✅ {name}")
+    else:
+        failed += 1
+        print(f"  ❌ {name} {detail}")
+
+
+# 1. 演示黑匣子日志 → 判别
+win.on_bb_demo()
+app.processEvents()
+lt = getattr(win, "bb_log_type", None)
+check("demo 日志判别产生结论", bool(lt and lt.get("verdict")), str(lt))
+print(f"     → 判别: {lt['verdict']} (置信度 {lt['confidence']})")
+check("判别理由非空", len(lt["reasons"]) >= 1)
+
+# 2. 模拟加载第二段日志并启用对比模式
+win.bb2_time = win.bb_time
+win.bb2_data = win.bb_data
+win.bb2_columns = win.bb_columns
+win.bb2_name = "对比日志(模拟)"
+win.bb_compare.setChecked(True)
+win.on_bb_plot()
+app.processEvents()
+axes = win.bb_canvas.figure.axes
+check("对比模式绘图不崩且有多轴", len(axes) >= 1)
+legends = [a.get_legend() for a in axes if a.get_legend()]
+check("对比模式有图例", len(legends) >= 1)
+
+# 3. AI 上下文包含判别结论
+ctx = win._collect_tuning_context()
+check("AI 上下文包含判别", "判别" in ctx or "空转" in ctx or "日志类型" in ctx,
+      ctx[:200])
+
+# 4. 取消对比再画一次
+win.bb_compare.setChecked(False)
+win.on_bb_plot()
+app.processEvents()
+check("单日志绘图正常", True)
+
+# 5. 渲染全部页面截图
+n_pages = win.pages.count() if hasattr(win, "pages") else 0
+check("存在 9 个页面", n_pages == 9, f"实际 {n_pages}")
+for i in range(n_pages):
+    try:
+        if hasattr(win, "sidebar"):
+            win.sidebar.setCurrentRow(i)
+        app.processEvents()
+        win.grab().save(os.path.join(OUT, f"page{i}.png"))
+    except Exception as e:
+        failed += 1
+        print(f"  💥 页面 {i} 渲染失败: {e}")
+print("  ✅ 全部页面截图完成")
+
+# 6. AI 页切到黑匣子页签不崩
+try:
+    win.bb_ai_btn.click()
+    app.processEvents()
+    check("黑匣子 AI 提问入口可点击", True)
+except Exception as e:
+    failed += 1
+    print(f"  💥 AI 入口: {e}")
+
+win.close()
+print(f"\n{'全部通过' if failed == 0 else str(failed) + ' 项失败'}")
+sys.exit(1 if failed else 0)
