@@ -528,6 +528,15 @@ def query_motor_count(ser: serial.Serial) -> int:
     return len(data) // 2
 
 
+def query_motor_values(ser: serial.Serial) -> list:
+    """读回飞控当前各电机输出（MSP_MOTOR，u16 小端 µs 值列表）。
+
+    与 BF MotorsTab 的 fcStore.motorData 对应：电机测试期间条形图
+    显示飞控实际输出（无论来自滑块 MSP_SET_MOTOR 还是遥控器输入）。"""
+    data = msp_request(ser, MSP_MOTOR)
+    return [u16(data, i) for i in range(0, len(data) - 1, 2)]
+
+
 def set_motors(ser: serial.Serial, values: list):
     """
     直接设置电机输出（MSP_SET_MOTOR），电机测试用。

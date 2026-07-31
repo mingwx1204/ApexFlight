@@ -269,6 +269,10 @@ class SlippyMapWidget(QWidget):
         self._zoom_timer.timeout.connect(self._apply_pending_zoom)
         self._backdrop_pm: QPixmap | None = None
         self._backdrop_factor = 1.0
+        # v0.99 滚轮锚定缩放：以鼠标位置为不动点
+        self._wheel_anchor = None                 # (x, y) 控件坐标
+        self._backdrop_anchor = None              # 过渡动画围绕的不动点
+        self.units = "metric"                     # 比例尺单位制（v0.99）
 
     # ---- 状态 ----
     def set_source(self, name: str):
@@ -276,6 +280,46 @@ class SlippyMapWidget(QWidget):
             return
         self.source_name = name
         self.update()
+
+    def set_units(self, units: str):
+        """比例尺单位制：metric（米/公里）或 imperial（英尺/英里）"""
+        self.units = units if units in ("metric", "imperial") else "metric"
+        self.update()
+
+    def _scale_bar(self):
+        """计算左下角比例尺：返回 (像素长度, 标注文本)。
+        Web 墨卡托米/像素 = 156543.03392·cos(lat) / 2^zoom。
+        在显示单位内取 1/2/5 整数（英制大单位按 0.1/0.2/0.5/1/2/5 英里）。"""
+        mpp = 156543.03392 * math.cos(math.radians(self.center_lat)) \
+            / (2 ** self.zoom)
+        if mpp <= 0:
+            return None
+        target = 90                            # 目标像素长度
+
+        def _nice(raw, steps=(5, 2, 1)):
+            """不超过 raw 的最大 1/2/5×10^n；raw < 1 时向下取档"""
+            if raw <= 0:
+                return 1
+            exp = math.floor(math.log10(raw))
+            for base in steps:
+                cand = base * 10 ** exp
+                if cand <= raw:
+                    return cand
+            return 10 ** (exp - 1)
+
+        if self.units == "imperial":
+            raw_ft = mpp * 3.28084 * target
+            if raw_ft >= 2640:                 # 超过半英里 → 按英里取整
+                for mi in (50, 20, 10, 5, 2, 1, 0.5, 0.2, 0.1):
+                    if mi * 5280 <= raw_ft:
+                        return mi * 5280 / 3.28084 / mpp, f"{mi:g} mi"
+            nice_ft = _nice(raw_ft)
+            return nice_ft / 3.28084 / mpp, f"{nice_ft:g} ft"
+        raw_m = mpp * target
+        nice_m = _nice(raw_m)
+        if nice_m >= 1000:
+            return nice_m / mpp, f"{nice_m / 1000:g} km"
+        return nice_m / mpp, f"{nice_m:g} m"
 
     def set_center(self, lon: float, lat: float, zoom: int = None):
         self.center_lon, self.center_lat = lon, lat
@@ -290,26 +334,53 @@ class SlippyMapWidget(QWidget):
     def zoom_out(self):
         self._zoom_to(self.zoom - 1)
 
-    def _zoom_to(self, new_zoom: int):
-        """切换缩放级别：旧画面截图拉伸垫底，新瓦片加载期间不发白"""
+    def _zoom_to(self, new_zoom: int, anchor=None):
+        """切换缩放级别：旧画面截图拉伸垫底，新瓦片加载期间不发白。
+        anchor=(x,y) 时过渡动画围绕该点缩放（滚轮锚定）。"""
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
         if new_zoom == self.zoom:
             return
         self._backdrop_pm = self.grab()
         self._backdrop_factor = 2.0 ** (new_zoom - self.zoom)
+        self._backdrop_anchor = anchor
         self.zoom = new_zoom
         QTimer.singleShot(700, self._clear_backdrop)
         self.update()
 
     def _clear_backdrop(self):
         self._backdrop_pm = None
+        self._backdrop_anchor = None
         self.update()
 
     def _apply_pending_zoom(self):
-        """滚轮连转结束后一次性应用累计缩放（防抖，避免逐级拉瓦片）"""
-        if self._zoom_pending:
-            pending, self._zoom_pending = self._zoom_pending, 0
-            self._zoom_to(self.zoom + pending)
+        """滚轮连转结束后一次性应用累计缩放（防抖，避免逐级拉瓦片）。
+        v0.99：以鼠标位置为不动点——锚点下的世界坐标缩放前后不变。"""
+        if not self._zoom_pending:
+            self._wheel_anchor = None
+            return
+        pending, self._zoom_pending = self._zoom_pending, 0
+        anchor, self._wheel_anchor = self._wheel_anchor, None
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom + pending))
+        dz = new_zoom - self.zoom
+        if dz == 0:
+            return
+        if anchor is None:
+            self._zoom_to(new_zoom)
+            return
+        w, h = self.width(), self.height()
+        ax, ay = anchor
+        # 锚点在旧缩放级下的世界坐标
+        cx, cy = lonlat_to_world(self.center_lon, self.center_lat, self.zoom)
+        wx = cx + (ax - w / 2)
+        wy = cy + (ay - h / 2)
+        # 新中心：让锚点世界坐标在新缩放级下仍落在鼠标处
+        scale = 2.0 ** dz
+        ncx = wx * scale - (ax - w / 2)
+        ncy = wy * scale - (ay - h / 2)
+        lon, lat = world_to_lonlat(ncx, ncy, new_zoom)
+        self._zoom_to(new_zoom, anchor=(ax, ay))
+        self.center_lon, self.center_lat = lon, lat
+        self.update()
 
     # ---- 绘制 ----
     def paintEvent(self, event):
@@ -319,10 +390,11 @@ class SlippyMapWidget(QWidget):
 
         # 缩放过渡：先把旧画面拉伸垫底（新瓦片加载期间画面连续）
         if self._backdrop_pm is not None:
+            ax, ay = self._backdrop_anchor or (w / 2, h / 2)
             p.save()
-            p.translate(w / 2, h / 2)
+            p.translate(ax, ay)
             p.scale(self._backdrop_factor, self._backdrop_factor)
-            p.translate(-w / 2, -h / 2)
+            p.translate(-ax, -ay)
             p.setOpacity(0.85)
             p.drawPixmap(0, 0, self._backdrop_pm)
             p.restore()
@@ -394,6 +466,21 @@ class SlippyMapWidget(QWidget):
             p.setPen(QPen(QColor("#FFFFFF"), 2))
             p.drawLine(int(sx), int(sy + 14), int(sx), int(sy + 26))
 
+        # 左下角比例尺（公制 米/公里 或 英制 英尺/英里）
+        bar = self._scale_bar()
+        if bar is not None:
+            blen, btext = bar
+            bx, by = 12, self.height() - 16
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(16, 18, 22, 170))
+            p.drawRoundedRect(bx - 6, by - 22, int(blen) + 60, 34, 6, 6)
+            p.setPen(QPen(QColor("#E8E8E8"), 2))
+            p.drawLine(bx, by, bx + int(blen), by)
+            p.drawLine(bx, by - 5, bx, by)
+            p.drawLine(bx + int(blen), by - 5, bx + int(blen), by)
+            p.setFont(QFont("Microsoft YaHei", 10))
+            p.drawText(bx + 4, by - 8, btext)
+
         # 左上角缩放级别水印
         p.setPen(QColor("#9AA0A6"))
         p.setFont(QFont("Microsoft YaHei", 11))
@@ -434,7 +521,9 @@ class SlippyMapWidget(QWidget):
             self._drag_from = None
 
     def wheelEvent(self, e):
-        """滚轮缩放：累计滚动量，停顿 140ms 后一次性应用（防抖）"""
+        """滚轮缩放：累计滚动量，停顿 140ms 后一次性应用（防抖）。
+        v0.99：记录鼠标位置作为缩放不动点。"""
+        self._wheel_anchor = (e.position().x(), e.position().y())
         delta = e.angleDelta().y()
         if delta > 0:
             self._zoom_pending += 1

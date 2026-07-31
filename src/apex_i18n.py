@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.98"
+APP_VERSION = "0.99"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -107,6 +107,34 @@ _EN = {
     "建议值": "Suggested", "变化": "Change",
     "语言已切换：界面已立即生效（状态栏等动态提示保持中文）。":
         "Language switched. (Dynamic status messages remain in Chinese.)",
+    # ---- v0.99：单位 / 机型卡片 / 日志标签 / 扫频视图 / 电机页 ----
+    "基础单位": "Units",
+    "公制（米 / 公里）": "Metric (m / km)",
+    "英制（英尺 / 英里）": "Imperial (ft / mi)",
+    "机型信息备注": "Craft Info",
+    "名称": "Name", "机架": "Frame", "电机": "Motors", "桨叶": "Props",
+    "电池": "Battery", "备注": "Notes",
+    "保存机型信息": "Save craft info",
+    "如：5寸花飞机": "e.g. 5-inch freestyle",
+    "如：Mark5": "e.g. Mark5",
+    "如：2207 1950KV": "e.g. 2207 1950KV",
+    "如：51466 三叶": "e.g. 51466 tri-blade",
+    "如：6S 1300mAh": "e.g. 6S 1300mAh",
+    "自由记录": "Free text",
+    "日志备注标签": "Log note tag",
+    "保存标签": "Save tag",
+    "全部叠加": "All axes",
+    "横滚": "Roll", "俯仰": "Pitch", "偏航": "Yaw",
+    "查看轴：": "Axis:",
+    "保存截图": "Save screenshot",
+    "把当前伯德图存为 PNG，方便发到交流群讨论":
+        "Save the Bode plot as PNG to share in your group",
+    "切换 全部叠加/单轴 视图（有结果时立即重绘）":
+        "Switch all-axes / single-axis view (redraws on results)",
+    "打开日志": "Open log",
+    "我已拆下螺旋桨，启用电机测试":
+        "Props removed - enable motor test",
+    "主控": "Master",
     # ---- 日志页 ----
     "应用日志": "Application log", "（暂无日志）": "(no log yet)",
     "日志已清空": "Log cleared", "日志文件 (*.txt)": "Log files (*.txt)",
@@ -332,8 +360,9 @@ def load_config() -> dict:
     try:
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(cfg, dict):
+            # 标量 + dict（机型信息备注等结构化配置）都保留
             defaults.update({k: v for k, v in cfg.items()
-                             if isinstance(v, (str, int, float, bool))})
+                             if isinstance(v, (str, int, float, bool, dict))})
     except Exception:
         pass
     return defaults

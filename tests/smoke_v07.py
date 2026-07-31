@@ -18,6 +18,10 @@ win.resize(1440, 900)
 win.show()
 app.processEvents()
 
+# 懒加载（v0.99）：测试直接调用黑匣子/AI 页方法，先构建对应页
+win._ensure_page(6)     # 黑匣子
+win._ensure_page(9)     # AI 助手
+
 failed = 0
 
 
@@ -64,7 +68,7 @@ check("单日志绘图正常", True)
 
 # 5. 渲染全部页面截图
 n_pages = win.pages.count() if hasattr(win, "pages") else 0
-check("存在 13 个页面", n_pages == 13, f"实际 {n_pages}")
+check("存在 12 个页面", n_pages == 12, f"实际 {n_pages}")
 for i in range(n_pages):
     try:
         if hasattr(win, "sidebar"):

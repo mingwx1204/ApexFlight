@@ -40,7 +40,7 @@ try:
         QDoubleSpinBox,
         QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
         QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-        QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
+        QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
         QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QLineEdit,
         QVBoxLayout, QWidget)
 except ImportError as _dep_err:
@@ -98,36 +98,16 @@ from apex_virtual import (    # v0.93：虚拟飞控（无真机体验全部功�
     VIRTUAL_PORT, VIRTUAL_PORT_LABEL, VirtualSerial)
 
 
+
 # ------------------------------------------------------------
-# 应用日志（v0.9）：会话内事件记录，参考 BF Configurator 的日志页
-# 同时写入 logs/app.log（超 1MB 自动轮转为 app.log.1）
+# 应用日志（v0.99 独立为 apex_log 模块，页签 mixin 共用）
 # ------------------------------------------------------------
-
-class _AppLogger(QObject):
-    """日志总线：后台线程 emit 信号，界面线程安全接收"""
-    appended = pyqtSignal(str)
-
-
-app_logger = _AppLogger()
-_app_log_lock = threading.Lock()
-_app_log_lines: list = []                     # 本次会话的全部日志行
-
-
-def log_event(message: str):
-    """记录一条应用日志（线程安全）：存内存缓冲 + 追加到 logs/app.log + 通知界面"""
-    line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {message}"
-    with _app_log_lock:
-        _app_log_lines.append(line)
-        try:
-            LOGS_DIR.mkdir(exist_ok=True)
-            log_file = LOGS_DIR / "app.log"
-            if log_file.exists() and log_file.stat().st_size > 1024 * 1024:
-                log_file.replace(LOGS_DIR / "app.log.1")   # 轮转，保留上一份
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-    app_logger.appended.emit(line)
+from apex_log import *        # noqa: F401,F403  app_logger / log_event 等
+from apex_log import _app_log_lines, _app_log_lock   # 显式导入（星号不含下划线名）
+from tab_map import MapTabMixin          # 适飞地图页
+from tab_sweep import SweepTabMixin      # 扫频调参页
+from tab_motor import MotorTabMixin      # 电机测试页
+from tab_log import LogTabMixin          # 应用日志页
 
 # ============================================================
 # 第五部分：后台工作线程（防止界面卡死）
@@ -144,6 +124,7 @@ class SerialWorker(QObject):
     write_done = pyqtSignal(str)              # 写入完成
     backup_done = pyqtSignal(str)             # 备份完成（文件路径）
     motor_count_ready = pyqtSignal(int)       # 电机通道数
+    motor_values_ready = pyqtSignal(list)     # 电机输出读回（µs 列表）
     flash_progress = pyqtSignal(str)          # 闪存下载进度提示
     flash_done = pyqtSignal(str)              # 闪存黑匣子下载完成（文件路径）
     tuning_ready = pyqtSignal(dict)           # Rates/滤波器读取成功
@@ -334,6 +315,16 @@ class SerialWorker(QObject):
             set_motors(self.serial_port, values)
         except (MspError, serial.SerialException) as e:
             self.error.emit(f"电机控制失败：{e}")
+
+    def read_motor_values(self):
+        """读回飞控实际电机输出（电机测试期间轮询，对标 BF motorData）"""
+        if not self.is_connected:
+            return
+        try:
+            self.motor_values_ready.emit(
+                query_motor_values(self.serial_port))
+        except (MspError, serial.SerialException):
+            pass                          # 轮询失败静默，下一轮再试
 
     # ---------- 闪存黑匣子下载 ----------
 
@@ -544,11 +535,15 @@ class SerialWorker(QObject):
 # 第六部分：GUI 主窗口
 # ============================================================
 
-class MainWindow(QMainWindow):
+class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
+                LogTabMixin, QMainWindow):
     """ApexFlight 主窗口（6 个功能页签）"""
 
     # AI 探测结果信号（后台线程探测 Ollama → 界面线程刷新显示）
     ai_probe_done = pyqtSignal(bool, list)
+    # 后台小任务完成信号（v0.99：替代 QTimer.singleShot 派发。
+    # 信号走事件队列 FIFO 投递，下载/分析等重负载期间不会被饿死）
+    task_result_ready = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -557,13 +552,16 @@ class MainWindow(QMainWindow):
         self._ai_messages = []                # 对话历史（发给模型的上下文）
         self._ai_reply_buffer = ""            # 当前这一轮回答的累积文字
         self._ai_busy = False                 # AI 是否正在回答
+        self._ai_probe_cache = None           # AI 探测结果缓存（懒加载用）
+        self._flash_cancel = None             # 闪存下载取消标志（须在任何
+        #                                       回调触发前就存在：on_error 是
+        #                                       全局槽，可能先于黑匣子页构建）
         self._threads = []                    # 持有线程引用，防止被回收
         self._poll_thread = None              # 慢通道轮询线程（竞态防护）
         self._poll_fast_thread = None         # 快通道轮询线程
         self._pid_names = []                  # 当前 PID 名称列表
         self._motor_sliders = []              # 电机滑块列表
         self._motor_count = 0
-        self._rc_bars = []                    # RC 通道显示条
         self._compat = None                   # 兼容性评估结果（连接后设置）
 
         # 用户配置（语言 / 默认波特率），启动时加载并应用
@@ -968,7 +966,7 @@ class MainWindow(QMainWindow):
         self._sidebar_entries = [
             ("👋", "欢迎"),
             ("📊", "仪表盘"), ("🎛️", "PID 调参"), ("🎯", "Rates 调参"),
-            ("🌊", "滤波器"), ("⚙️", "电机测试"), ("📡", "接收机"),
+            ("🌊", "滤波器"), ("⚙️", "电机测试"),
             ("📈", "黑匣子"), ("🌀", "扫频调参"), ("💾", "调参方案"), ("🤖", "AI 助手"),
             ("🗺️", "适飞地图"),
             ("📜", "日志"),
@@ -979,19 +977,28 @@ class MainWindow(QMainWindow):
         body.addWidget(self.sidebar)
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_welcome_tab())
-        self.pages.addWidget(self._build_dashboard_tab())
-        self.pages.addWidget(self._build_pid_tab())
-        self.pages.addWidget(self._build_rates_tab())
-        self.pages.addWidget(self._build_filter_tab())
-        self.pages.addWidget(self._build_motor_tab())
-        self.pages.addWidget(self._build_rc_tab())
-        self.pages.addWidget(self._build_blackbox_tab())
-        self.pages.addWidget(self._build_sweep_tab())
-        self.pages.addWidget(self._build_preset_tab())
-        self.pages.addWidget(self._build_ai_tab())
-        self.pages.addWidget(self._build_map_tab())
-        self.pages.addWidget(self._build_log_tab())
+        # v0.99 页签懒加载：重资源页（黑匣子/扫频/AI/地图）首次切换到
+        # 才构建——matplotlib 加载、瓦片线程池都不挡启动，冷启动明显更快
+        self._builders = [self._build_welcome_tab, self._build_dashboard_tab,
+                          self._build_pid_tab, self._build_rates_tab,
+                          self._build_filter_tab, self._build_motor_tab,
+                          self._build_blackbox_tab, self._build_sweep_tab,
+                          self._build_preset_tab, self._build_ai_tab,
+                          self._build_map_tab, self._build_log_tab]
+        self._page_built = [True] * len(self._builders)
+        _LAZY_PAGES = (6, 7, 9, 10)          # 黑匣子/扫频/AI/地图
+        for i, builder in enumerate(self._builders):
+            if i in _LAZY_PAGES:
+                ph = QWidget()
+                phl = QVBoxLayout(ph)
+                lab = QLabel(tr("页面加载中…"))
+                lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lab.setStyleSheet("color: #7A828C; font-size: 15px;")
+                phl.addWidget(lab)
+                self.pages.addWidget(ph)
+                self._page_built[i] = False
+            else:
+                self.pages.addWidget(builder())
         body.addWidget(self.pages, 1)
 
         body_widget = QWidget()
@@ -1007,11 +1014,24 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(tr("就绪：请选择串口后点击「连接」"))
 
+    def _ensure_page(self, index: int):
+        """懒加载：首次切换到某页时才真正构建（v0.99）"""
+        if self._page_built[index]:
+            return
+        old = self.pages.widget(index)
+        w = self._builders[index]()
+        self.pages.removeWidget(old)
+        old.deleteLater()
+        self.pages.insertWidget(index, w)
+        self._page_built[index] = True
+        log_event(f"页签首次加载：{self._sidebar_entries[index][1]}")
+
     def _on_page_changed(self, index: int):
         """切换页面：先切索引，再给新页面加 180ms 淡入动画（v0.91）。
         动画结束后移除透明效果，避免影响后续重绘性能。"""
         from PyQt6.QtCore import QAbstractAnimation, QPropertyAnimation
         from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        self._ensure_page(index)
         self.pages.setCurrentIndex(index)
         page = self.pages.currentWidget()
         if page is None:
@@ -1025,692 +1045,51 @@ class MainWindow(QMainWindow):
         anim.finished.connect(lambda: page.setGraphicsEffect(None))
         anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
-    # ---------- 页签 11：适飞地图（v0.93，高德卫星图 + UOM 空域工具） ----------
-
-    def _build_map_tab(self) -> QWidget:
-        """适飞地图页：卫星图底图切换、起飞点标记与坐标复制、UOM 入口"""
-        from apex_map import SlippyMapWidget, TILE_SOURCES, gcj02_to_wgs84
-        self._gcj02_to_wgs84 = gcj02_to_wgs84   # 处理器里复用
-
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        # 顶栏：底图切换 + 缩放 + 定位 + UOM
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel(tr("底图：")))
-        self.map_source_combo = QComboBox()
-        self.map_source_combo.addItems(list(TILE_SOURCES.keys()))
-        self.map_source_combo.setCurrentText("卫星+路网标注")   # 与控件默认一致
-        self.map_source_combo.setMinimumWidth(150)
-        bar.addWidget(self.map_source_combo)
-        zoom_in = QPushButton("＋ " + tr("放大"))
-        zoom_in.clicked.connect(lambda: self.map_widget.zoom_in())
-        zoom_out = QPushButton("－ " + tr("缩小"))
-        zoom_out.clicked.connect(lambda: self.map_widget.zoom_out())
-        bar.addWidget(zoom_in)
-        bar.addWidget(zoom_out)
-        locate_btn = QPushButton("📍 " + tr("定位我的城市"))
-        locate_btn.clicked.connect(self._map_locate)
-        bar.addWidget(locate_btn)
-        # 地点搜索：比定位更可靠的主动找点方式（IP/WiFi 定位都可能漂）
-        self.map_search_edit = QLineEdit()
-        self.map_search_edit.setPlaceholderText(tr("搜索地点，如：柳州"))
-        self.map_search_edit.setClearButtonEnabled(True)
-        self.map_search_edit.setMaximumWidth(200)
-        self.map_search_edit.returnPressed.connect(self._map_search)
-        bar.addWidget(self.map_search_edit)
-        search_btn = QPushButton("🔍 " + tr("搜索"))
-        search_btn.clicked.connect(self._map_search)
-        bar.addWidget(search_btn)
-        uom_btn = QPushButton("🗺️ " + tr("同步 UOM 适飞区"))
-        uom_btn.setObjectName("connectBtn")
-        uom_btn.clicked.connect(self._map_sync_uom)
-        bar.addWidget(uom_btn)
-        bar.addStretch()
-        layout.addLayout(bar)
-
-        # 地图本体
-        self.map_widget = SlippyMapWidget()
-        self.map_source_combo.currentTextChanged.connect(
-            self.map_widget.set_source)
-        self.map_widget.marker_changed.connect(self._on_map_marker)
-        layout.addWidget(self.map_widget, 1)
-
-        # 底栏：起飞点坐标（GCJ-02 + WGS-84）+ 复制 + UOM 提示
-        bottom = QHBoxLayout()
-        self.map_marker_label = QLabel(
-            tr("单击地图放置起飞点标记，坐标供 UOM 空域申请填表使用"))
-        self.map_marker_label.setStyleSheet(
-            "color: #9AA0A6; font-size: 14px;")
-        bottom.addWidget(self.map_marker_label, 1)
-        self.map_copy_btn = QPushButton("📋 " + tr("复制坐标"))
-        self.map_copy_btn.setEnabled(False)
-        self.map_copy_btn.clicked.connect(self._map_copy_coords)
-        bottom.addWidget(self.map_copy_btn)
-        layout.addLayout(bottom)
-        return tab
-
-    def _on_map_marker(self, lon: float, lat: float):
-        """起飞点标记更新：同时显示 GCJ-02 与 WGS-84 坐标"""
-        wlon, wlat = self._gcj02_to_wgs84(lon, lat)
-        self._map_wgs = (wlon, wlat)
-        self.map_marker_label.setText(
-            f"📍 起飞点  GCJ-02：{lon:.6f}, {lat:.6f}    "
-            f"WGS-84：{wlon:.6f}, {wlat:.6f}")
-        self.map_marker_label.setStyleSheet(
-            "color: #3EC6E8; font-size: 14px;")
-        self.map_copy_btn.setEnabled(True)
-
-    def _map_copy_coords(self):
-        """复制 WGS-84 坐标（UOM 申请填表格式：经度,纬度 六位小数）"""
-        wlon, wlat = getattr(self, "_map_wgs", (None, None))
-        if wlon is None:
-            return
-        self._copy_text(f"{wlon:.6f},{wlat:.6f}")
-
-    def _map_locate(self):
-        """定位：优先系统定位服务（QtPositioning，Windows 位置服务 /
-        WiFi 定位，精度远高于 IP）；不可用 / 无权限 / 超时则回退
-        IP 粗定位。任何一步失败都不会卡死界面。"""
-        self.statusBar().showMessage("正在定位（优先系统定位服务）……")
-        self._geo_done = False
-        try:
-            from PyQt6.QtPositioning import QGeoPositionInfoSource
-            src = QGeoPositionInfoSource.createDefaultSource(self)
-        except Exception as e:                    # 模块缺失/插件异常
-            log_event(f"系统定位不可用：{e}")
-            self._map_locate_ip_fallback("系统定位服务不可用")
-            return
-        if src is None:
-            self._map_locate_ip_fallback("本机无系统定位服务")
-            return
-        self._geo_src = src                       # 防被 GC
-        src.positionUpdated.connect(self._on_geo_position)
-        if hasattr(src, "errorOccurred"):
-            src.errorOccurred.connect(self._on_geo_error)
-        # 兜底定时器：10 秒内没有任何结果就走 IP 回退
-        self._geo_timer = QTimer(self)
-        self._geo_timer.setSingleShot(True)
-        self._geo_timer.setInterval(10000)
-        self._geo_timer.timeout.connect(
-            lambda: self._geo_give_up("系统定位超时"))
-        self._geo_timer.start()
-        src.requestUpdate(8000)                   # 单次定位，内部 8s 超时
-
-    def _on_geo_position(self, info):
-        """系统定位成功：WGS-84 → GCJ-02 落图，精度如实提示"""
-        if getattr(self, "_geo_done", True):
-            return
-        self._geo_done = True
-        self._geo_timer.stop()
-        try:
-            from PyQt6.QtPositioning import QGeoPositionInfo
-            coord = info.coordinate()
-            if not coord.isValid():
-                raise ValueError("坐标无效")
-            lat, lon = coord.latitude(), coord.longitude()
-            acc = info.attribute(
-                QGeoPositionInfo.Attribute.HorizontalAccuracy)
-        except Exception as e:
-            self._geo_give_up(f"系统定位结果异常（{e}）")
-            return
-        from apex_map import wgs84_to_gcj02
-        glon, glat = wgs84_to_gcj02(lon, lat)
-        self.map_widget.set_center(glon, glat, 14)
-        self.map_widget.marker = (glon, glat)
-        self.map_widget.marker_changed.emit(glon, glat)
-        self.map_widget.update()
-        acc_txt = (f"，误差约 {int(acc)} 米" if acc and 0 < acc < 50000
-                   else "（WiFi 定位，精度较高）")
-        self.statusBar().showMessage(
-            f"已通过系统定位服务定位{acc_txt}；起飞点可再拖动精调", 8000)
-        log_event(f"系统定位成功：{lat:.5f},{lon:.5f}")
-
-    def _on_geo_error(self, *_):
-        self._geo_give_up("系统定位失败（可在 Windows 设置→隐私→位置 开启）")
-
-    def _geo_give_up(self, reason: str):
-        """系统定位没戏了：清理状态，回退 IP 粗定位"""
-        if getattr(self, "_geo_done", False):
-            return
-        self._geo_done = True
-        try:
-            self._geo_timer.stop()
-        except Exception:
-            pass
-        log_event(f"{reason}，回退 IP 定位")
-        self._map_locate_ip_fallback(reason)
-
-    def _map_locate_ip_fallback(self, reason: str = ""):
-        """IP 粗定位（回退方案）：双数据源（ip-api 中文城市名优先，
-        ipinfo 兜底），定位后放置起飞点标记并如实提示精度"""
-        prefix = f"{reason}，改用 IP 粗定位……" if reason else "正在通过 IP 定位……"
-        self.statusBar().showMessage(prefix)
-
-        def work():
-            import json as _json
-            import urllib.request as _u
-            # 首选 ip-api.com：返回中文城市名，国内运营商数据较全
-            try:
-                with _u.urlopen(
-                        "http://ip-api.com/json/?lang=zh-CN&fields"
-                        "=status,country,regionName,city,lat,lon",
-                        timeout=8) as r:
-                    d = _json.loads(r.read().decode())
-                if d.get("status") == "success":
-                    city = d.get("city") or d.get("regionName") or ""
-                    return d["lat"], d["lon"], city
-            except Exception:
-                pass
-            # 兜底 ipinfo.io
-            with _u.urlopen("https://ipinfo.io/json", timeout=8) as r:
-                d = _json.loads(r.read().decode())
-            lat, lon = (float(v) for v in d["loc"].split(","))
-            return lat, lon, d.get("city", "")
-
-        def done(result):
-            lat, lon, city = result
-            from apex_map import wgs84_to_gcj02
-            glon, glat = wgs84_to_gcj02(lon, lat)
-            self.map_widget.set_center(glon, glat, 12)
-            # 把起飞点标记放到定位点，坐标顺手就有了
-            self.map_widget.marker = (glon, glat)
-            self.map_widget.marker_changed.emit(glon, glat)
-            self.map_widget.update()
-            where = f"：{city}" if city else ""
-            self.statusBar().showMessage(
-                f"已定位{where}（IP 定位基于运营商出口，连手机热点时会漂到"
-                f"号码归属地，请拖动地图或用搜索框精调起飞点）", 9000)
-
-        self._run_simple_task(work, done, "IP 定位失败：检查网络后重试")
-
-    def _map_search(self):
-        """地点搜索：Nominatim 地理编码（WGS-84 → GCJ-02 落图）。
-        定位不准时最可靠的找点方式——直接搜地名。"""
-        q = self.map_search_edit.text().strip()
-        if not q:
-            self.statusBar().showMessage("先输入要搜索的地点，如：柳州", 4000)
-            return
-        self.statusBar().showMessage(f"正在搜索「{q}」……")
-
-        def work():
-            import json as _json
-            import urllib.parse as _up
-            import urllib.request as _u
-            url = ("https://nominatim.openstreetmap.org/search?q="
-                   + _up.quote(q)
-                   + "&format=json&limit=1&accept-language=zh-CN")
-            req = _u.Request(url, headers={
-                "User-Agent": "ApexFlight/0.96 (local drone configurator)"})
-            with _u.urlopen(req, timeout=8) as r:
-                arr = _json.loads(r.read().decode())
-            if not arr:
-                raise ValueError("没找到这个地点，换个关键词（如加上省/市）试试")
-            d = arr[0]
-            name = str(d.get("display_name", q))
-            for sep in ("，", ","):
-                name = name.split(sep)[0]
-            return float(d["lat"]), float(d["lon"]), name
-
-        def done(result):
-            lat, lon, name = result
-            from apex_map import wgs84_to_gcj02
-            glon, glat = wgs84_to_gcj02(lon, lat)
-            self.map_widget.set_center(glon, glat, 13)
-            self.map_widget.marker = (glon, glat)
-            self.map_widget.marker_changed.emit(glon, glat)
-            self.map_widget.update()
-            self.statusBar().showMessage(
-                f"已定位到：{name}（单击地图可微调起飞点）", 6000)
-            log_event(f"地点搜索：{q} → {lat:.5f},{lon:.5f}")
-
-        self._run_simple_task(
-            work, done, "搜索失败（网络受限时可改用定位按钮或手动拖动）")
-
-    def _map_sync_uom(self):
-        """同步 UOM 适飞区：实测连通性后如实说明——UOM 空域数据
-        需实名登录，本软件提供官网直达 + 坐标填表工具"""
-        import urllib.request as _u
-        self.statusBar().showMessage("正在连接 UOM 平台……")
-        try:
-            req = _u.Request("https://uom.caac.gov.cn/",
-                             headers={"User-Agent": "Mozilla/5.0"})
-            with _u.urlopen(req, timeout=6):
-                pass
-            reachable = True
-        except Exception:
-            reachable = False
-        msg = QMessageBox(self)
-        msg.setWindowTitle(tr("UOM 适飞区同步"))
-        if reachable:
-            text = ("已连通 UOM 平台（uom.caac.gov.cn）。\n\n"
-                    "按民航局 MH/T 数据接口规范，适飞空域数据需"
-                    "实名账号登录后查询，暂无匿名公开接口，"
-                    "因此无法直接叠加到本地地图。\n\n"
-                    "建议流程：\n"
-                    "① 在本页地图上单击放置起飞点，复制 WGS-84 坐标\n"
-                    "② 打开 UOM 平台登录 → 运行管理 → 空域信息查询\n"
-                    "③ 粘贴坐标查询适飞/管制属性，截图留存")
-        else:
-            text = ("暂时无法连接 UOM 平台（检查网络/代理）。\n\n"
-                    "适飞空域数据需实名登录 uom.caac.gov.cn 查询，"
-                    "本页地图的坐标复制功能不受影响。")
-        msg.setText(text)
-        open_btn = msg.addButton("打开 UOM 平台",
-                                 QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton(QMessageBox.StandardButton.Close)
-        msg.exec()
-        if msg.clickedButton() is open_btn:
-            __import__("webbrowser").open("https://uom.caac.gov.cn/")
-            log_event("已打开 UOM 平台官网")
+    # ---------- 后台小任务派发 ----------
 
     def _run_simple_task(self, work, done, err_hint: str):
         """在后台线程跑无参函数 work()，UI 线程回调 done(result)。
 
-        每次调用独立闭包状态，多个任务并发（如边搜索边下载）互不干扰。"""
+        每次调用独立闭包状态，多个任务并发互不干扰（v0.96）；
+        完成派发走 task_result_ready 信号（v0.99）——信号按事件队列
+        FIFO 投递，与下载进度等高频信号同优先级，杜绝 QTimer 派发
+        在重负载下被饿死导致的「点了没反应」。"""
         import threading as _th
-        state = {}
+        state = {"done": done}
 
         def runner():
             try:
                 state["result"] = work()
             except Exception as e:
                 state["err"] = f"{err_hint}（{e}）"
-            QTimer.singleShot(0, finish)
-
-        def finish():
-            if "err" in state:
-                self.statusBar().showMessage(state["err"], 7000)
-                return
-            done(state.get("result"))
+            self.task_result_ready.emit(state)
 
         _th.Thread(target=runner, daemon=True).start()
 
-    # ---------- 页签 8.5：扫频调参（v0.98，BF2026 Chirp 同源系统辨识） ----------
-
-    def _build_sweep_tab(self) -> QWidget:
-        """扫频精准调参页：从黑匣子日志估计频率响应（Welch 互谱法），
-        带宽/相位裕度/灵敏度/谐振全部实测计算，建议逐条带公式依据"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        self._sweep_csv = None
-        self._sweep_sugs = []
-
-        # ---- 顶部：原理说明 + 采集指导 + 日志选择 ----
-        guide = QGroupBox(tr("扫频精准调参（实测数据 + 数学推导，不用 AI 猜）"))
-        g = QVBoxLayout(guide)
-        guide_text = QLabel(
-            "原理：用黑匣子日志的 setpoint→gyro 数据估计三轴频率响应"
-            "（与 BF2026 Chirp Autotune 同源的 Welch 互谱系统辨识），"
-            "实测带宽 / 相位裕度 / 灵敏度峰值 / 谐振峰，再按公式推导建议。\n"
-            "采集：飞一段约 20 秒——3 次油门斜坡 + 各轴 2~3 次干脆的"
-            "翻滚/甩杆（动作越干脆相干性越高）；"
-            "刷 BF2026 固件开 Chirp 模式采集效果最佳。")
-        guide_text.setWordWrap(True)
-        guide_text.setStyleSheet("color: #9AA0A6;")
-        g.addWidget(guide_text)
-        bar = QHBoxLayout()
-        self.sweep_open_btn = QPushButton("📂 " + tr("打开日志"))
-        self.sweep_open_btn.clicked.connect(self._sweep_open_log)
-        bar.addWidget(self.sweep_open_btn)
-        self.sweep_usebb_btn = QPushButton("📈 " + tr("用黑匣子页当前日志"))
-        self.sweep_usebb_btn.setToolTip(
-            "直接使用「黑匣子」页已加载的日志段，不用重新选择文件")
-        self.sweep_usebb_btn.clicked.connect(self._sweep_use_bb)
-        bar.addWidget(self.sweep_usebb_btn)
-        self.sweep_analyze_btn = QPushButton("🌀 " + tr("开始分析"))
-        self.sweep_analyze_btn.setObjectName("connectBtn")
-        self.sweep_analyze_btn.setEnabled(False)
-        self.sweep_analyze_btn.clicked.connect(self._sweep_analyze)
-        bar.addWidget(self.sweep_analyze_btn)
-        self.sweep_file_label = QLabel(tr("未选择日志"))
-        self.sweep_file_label.setStyleSheet("color: #9AA0A6;")
-        bar.addWidget(self.sweep_file_label, 1)
-        g.addLayout(bar)
-        layout.addWidget(guide)
-
-        # ---- 中部：频率响应图（幅值/相位/相干性）+ 三轴指标表 ----
-        mid = QHBoxLayout()
-        if load_matplotlib():
-            self.sweep_figure = Figure(figsize=(7, 7.2),
-                                       facecolor="#14171B")
-            self.sweep_canvas = FigureCanvasQTAgg(self.sweep_figure)
-            self.sweep_toolbar = NavigationToolbar2QT(
-                self.sweep_canvas, tab)
-            chart_col = QVBoxLayout()
-            chart_col.addWidget(self.sweep_toolbar)
-            chart_col.addWidget(self.sweep_canvas, 1)
-            mid.addLayout(chart_col, 3)
-        else:
-            mid.addWidget(QLabel("⚠️ 未安装 matplotlib，无法绘图"), 3)
-        right = QVBoxLayout()
-        right.addWidget(QLabel(tr("三轴辨识指标")))
-        self.sweep_metrics = QTableWidget(3, 6)
-        self.sweep_metrics.setHorizontalHeaderLabels(
-            ["轴", "带宽 Hz", "相位裕度 °", "灵敏度峰值", "相干性", "谐振峰 Hz"])
-        self.sweep_metrics.verticalHeader().setVisible(False)
-        self.sweep_metrics.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self.sweep_metrics.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers)
-        right.addWidget(self.sweep_metrics, 1)
-        mid.addLayout(right, 2)
-        layout.addLayout(mid, 3)
-
-        # ---- 底部：精准建议表 + 应用 ----
-        sug_box = QGroupBox(tr("精准调参建议（每条都带数学依据）"))
-        sug_col = QVBoxLayout(sug_box)
-        self.sweep_sug_table = QTableWidget(0, 6)
-        self.sweep_sug_table.setHorizontalHeaderLabels(
-            ["参数", "轴", "当前值", "建议值", "变化", "依据"])
-        self.sweep_sug_table.verticalHeader().setVisible(False)
-        self.sweep_sug_table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.Stretch)
-        for c in range(5):
-            self.sweep_sug_table.horizontalHeader().setSectionResizeMode(
-                c, QHeaderView.ResizeMode.ResizeToContents)
-        self.sweep_sug_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers)
-        sug_col.addWidget(self.sweep_sug_table, 1)
-        apply_row = QHBoxLayout()
-        self.sweep_apply_btn = QPushButton("⚡ " + tr("应用 PID 建议到飞控"))
-        self.sweep_apply_btn.setObjectName("connectBtn")
-        self.sweep_apply_btn.setEnabled(False)
-        self.sweep_apply_btn.setToolTip(
-            "把带宽失衡类建议按百分比落实到 PID 表（P/D 同步缩放），\n"
-            "写入前自动备份、写后读回校验；滤波器类建议请按建议频率手动调整")
-        self.sweep_apply_btn.clicked.connect(self._sweep_apply)
-        apply_row.addWidget(self.sweep_apply_btn)
-        note = QLabel(tr("滤波器类建议请到「滤波器」页按建议频率手动调整；"
-                         "首次应用后请拆桨低空试飞验证"))
-        note.setStyleSheet("color: #9AA0A6; font-size: 13px;")
-        apply_row.addWidget(note, 1)
-        sug_col.addLayout(apply_row)
-        layout.addWidget(sug_box, 2)
-        return tab
-
-    def _sweep_open_log(self):
-        """选择日志：.bbl/.bfl 解码后取最后一段（最近一次飞行）"""
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, tr("选择黑匣子日志"), str(LOGS_DIR),
-            tr("黑匣子日志 (*.bbl *.bfl *.csv);;所有文件 (*)"))
-        if not path_str:
+    def _simple_task_dispatch(self, state: dict):
+        """UI 线程：分发后台小任务结果（信号槽，永远按到达顺序执行）"""
+        if "err" in state:
+            self.statusBar().showMessage(state["err"], 7000)
             return
-        p = Path(path_str)
-        if p.suffix.lower() == ".csv":
-            self._sweep_csv = p
-        else:
-            from apex_blackbox import decode_blackbox
-            self.statusBar().showMessage("正在解码日志……")
-            try:
-                csvs = decode_blackbox(p)
-            except Exception as e:
-                QMessageBox.warning(self, "ApexFlight", f"解码失败：{e}")
-                return
-            if not csvs:
-                QMessageBox.warning(self, "ApexFlight", "解码没有产出任何日志段")
-                return
-            self._sweep_csv = Path(csvs[-1])     # 最后一段 = 最近一次飞行
-            if len(csvs) > 1:
-                self.statusBar().showMessage(
-                    f"共 {len(csvs)} 段飞行记录，已选最后一段（最近一次）", 6000)
-        self.sweep_file_label.setText(self._sweep_csv.name)
-        self.sweep_analyze_btn.setEnabled(True)
+        state["done"](state.get("result"))
 
-    def _sweep_use_bb(self):
-        """直接用黑匣子页当前加载的日志段，省去重复选择"""
-        if not self.bb_sessions:
-            self.statusBar().showMessage(
-                "黑匣子页还没有加载日志，先去那边打开或从飞控下载", 5000)
-            return
-        idx = self.bb_session_combo.currentIndex()
-        if not (0 <= idx < len(self.bb_sessions)):
-            idx = 0
-        self._sweep_csv = Path(self.bb_sessions[idx])
-        self.sweep_file_label.setText(self._sweep_csv.name)
-        self.sweep_analyze_btn.setEnabled(True)
+    # ---- v1.0 伯德图交互：截图（扫频/黑匣子共用） ----
 
-    def _sweep_analyze(self):
-        """后台线程做系统辨识，UI 线程回填图表/指标/建议"""
-        csv_path = self._sweep_csv
-        if csv_path is None:
-            return
-        self.sweep_analyze_btn.setEnabled(False)
-        self.statusBar().showMessage("正在做系统辨识（Welch 互谱平均）……")
-        # 连着飞控时把当前 PID 带给建议表填"当前值"
-        current_pids = None
-        if self.worker.is_connected and self._pid_names:
-            try:
-                vals = [tuple(int(self.pid_table.item(row, c).text())
-                              for c in range(3)) for row in range(3)]
-                current_pids = {"roll": vals[0], "pitch": vals[1],
-                                "yaw": vals[2]}
-            except Exception:
-                current_pids = None
-
-        def work():
-            from apex_sweep import analyze_log
-            try:
-                return analyze_log(csv_path, current_pids)
-            except Exception as e:
-                return {"error": str(e)}
-
-        def done(result):
-            self.sweep_analyze_btn.setEnabled(True)
-            if "error" in result:
-                self.statusBar().showMessage(
-                    f"扫频分析失败：{result['error']}", 8000)
-                log_event(f"扫频分析失败：{result['error']}")
-                return
-            self._sweep_result = result
-            self._sweep_show_result(result)
-            log_event(f"扫频分析完成：{csv_path.name}")
-            self.statusBar().showMessage("扫频分析完成 ✅", 4000)
-
-        self._run_simple_task(work, done, "扫频分析失败")
-
-    def _sweep_show_result(self, result: dict):
-        """把辨识结果画到图/表上"""
-        axes = result["axes"]
-        colors = {"横滚": "#3EC6E8", "俯仰": "#F5A83D", "偏航": "#6FCF97"}
-
-        # ---- 频率响应三子图 ----
-        if hasattr(self, "sweep_canvas"):
-            fig = self.sweep_figure
-            fig.clear()
-            ax1 = fig.add_subplot(311)
-            ax2 = fig.add_subplot(312, sharex=ax1)
-            ax3 = fig.add_subplot(313, sharex=ax1)
-            legend_done = False
-            for name, m in axes.items():
-                if "mag_db" not in m:
-                    continue
-                f = m["freqs"]
-                c = colors.get(name, "#FFFFFF")
-                mask = (f >= 2) & (f <= min(600, m["fs"] / 2))
-                ax1.plot(f[mask], m["mag_db"][mask], color=c, lw=1.3,
-                         label=name)
-                ax2.plot(f[mask], m["phase_deg"][mask], color=c, lw=1.0)
-                ax3.plot(f[mask], m["coh"][mask], color=c, lw=1.0)
-                bw = m.get("bandwidth_hz")
-                if bw:
-                    ax1.axvline(bw, color=c, ls="--", alpha=0.45)
-                legend_done = True
-            ax1.axhline(-3, color="#E06C75", ls=":", lw=0.9)
-            ax1.set_ylabel("幅值 dB")
-            ax2.set_ylabel("相位 °")
-            ax3.set_ylabel("相干性")
-            ax3.set_ylim(0, 1.05)
-            ax3.set_xlabel("频率 Hz")
-            for ax in (ax1, ax2, ax3):
-                ax.set_xscale("log")
-                ax.set_xlim(2, 600)
-                ax.grid(True, alpha=0.25)
-                ax.set_facecolor("#14171B")
-                ax.tick_params(colors="#C9CDD3", labelsize=9)
-                ax.xaxis.label.set_color("#C9CDD3")
-                ax.yaxis.label.set_color("#C9CDD3")
-                for sp in ax.spines.values():
-                    sp.set_color("#3A3F47")
-            if legend_done:
-                leg = ax1.legend(loc="upper right", fontsize=9)
-                leg.get_frame().set_facecolor("#1A1D22")
-                leg.get_frame().set_edgecolor("#3A3F47")
-                for t in leg.get_texts():
-                    t.set_color("#C9CDD3")
-            fig.tight_layout()
-            self.sweep_canvas.draw()
-
-        # ---- 指标表 ----
-        for r, name in enumerate(("横滚", "俯仰", "偏航")):
-            m = axes.get(name, {})
-            if "error" in m:
-                cells = [name, "—", "—", "—", "—", m["error"]]
-            else:
-                sp_db = m.get("sensitivity_peak_db")
-                cells = [
-                    name,
-                    str(m.get("bandwidth_hz") or "—"),
-                    str(m.get("phase_margin_deg") or "—"),
-                    (f"{sp_db}dB@{m.get('sensitivity_peak_hz')}Hz"
-                     if sp_db is not None else "—"),
-                    (f"{m['coherence']:.0%}"
-                     if m.get("coherence") is not None else "—"),
-                    (", ".join(str(fr) for fr, _ in m.get("resonances", []))
-                     or "—"),
-                ]
-            for c, text in enumerate(cells):
-                item = QTableWidgetItem(str(text))
-                if c == 0:
-                    item.setForeground(QColor(colors[name]))
-                self.sweep_metrics.setItem(r, c, item)
-
-        # ---- 建议表 + 应用按钮 ----
-        sugs = result["suggestions"]
-        self._sweep_sugs = sugs
-        self.sweep_sug_table.setRowCount(len(sugs))
-        level_color = {"danger": "#E06C75", "action": "#F5A83D",
-                       "info": "#9AA0A6"}
-        for r, s in enumerate(sugs):
-            vals = [s["param"], s["axis"], s["current"], s["suggested"],
-                    s["change"], s["reason"]]
-            for c, text in enumerate(vals):
-                item = QTableWidgetItem(str(text))
-                item.setForeground(
-                    QColor(level_color.get(s["level"], "#C9CDD3")))
-                item.setToolTip(str(s["reason"]))
-                self.sweep_sug_table.setItem(r, c, item)
-        has_pid = any(s["param"] == "PID" for s in sugs)
-        self.sweep_apply_btn.setEnabled(
-            has_pid and self.worker.is_connected and bool(self._pid_names))
-
-    def _sweep_apply(self):
-        """把 PID 类建议（P/D 百分比缩放）落实到 PID 表并安全写入"""
-        sugs = [s for s in self._sweep_sugs if s["param"] == "PID"]
-        if not sugs:
-            return
-        import re as _re
-        axis_row = {"横滚": 0, "俯仰": 1, "偏航": 2}
-        plan = []
-        for s in sugs:
-            m = _re.search(r"\+(\d+)%", s["change"])
-            row = axis_row.get(s["axis"])
-            if not m or row is None or row >= self.pid_table.rowCount():
-                continue
-            k = 1 + int(m.group(1)) / 100
-            for col, label in ((0, "P"), (2, "D")):
-                item = self.pid_table.item(row, col)
-                if not item:
-                    continue
-                old = int(item.text())
-                new = max(0, min(255, round(old * k)))
-                if new != old:
-                    plan.append((row, col, s["axis"], label, old, new))
-        if not plan:
-            self.statusBar().showMessage("没有可应用的 PID 数值变化", 4000)
-            return
-        lines = "\n".join(f"{a} {l}：{o} → {n}"
-                          for _, _, a, l, o, n in plan)
-        reply = QMessageBox.question(
-            self, tr("确认写入"),
-            "扫频建议将修改以下 PID（写入前自动备份，写后读回校验）：\n\n"
-            f"{lines}\n\n确定继续吗？")
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        for row, col, _, _, _, new in plan:
-            self.pid_table.item(row, col).setText(str(new))
-        values = [tuple(int(self.pid_table.item(row, c).text())
-                        for c in range(3))
-                  for row in range(len(self._pid_names))]
-        log_event(f"扫频调参：应用 {len(plan)} 项 PID 调整")
-        self._run_in_thread(self.worker.write_pids,
-                            self._pid_names, values, True)
-
-    # ---------- 页签 10：应用日志（参考 BF Configurator 日志页） ----------
-
-    def _build_log_tab(self) -> QWidget:
-        """应用日志页：连接/写入/下载/错误等事件实时滚动显示，
-        随时可回看，可清空、另存、打开日志文件夹"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Consolas", 9))
-        with _app_log_lock:
-            history = list(_app_log_lines)
-        self.log_view.setPlainText(
-            "\n".join(history) if history else tr("（暂无日志）"))
-        layout.addWidget(self.log_view, 1)
-
-        btn_row = QHBoxLayout()
-        self.log_clear_btn = QPushButton(tr("清空"))
-        self.log_clear_btn.clicked.connect(self._on_log_clear)
-        btn_row.addWidget(self.log_clear_btn)
-        self.log_save_btn = QPushButton(tr("另存为…"))
-        self.log_save_btn.clicked.connect(self._on_log_save)
-        btn_row.addWidget(self.log_save_btn)
-        self.log_open_btn = QPushButton(tr("打开日志文件夹"))
-        self.log_open_btn.clicked.connect(self._open_log_folder)
-        btn_row.addWidget(self.log_open_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-        return tab
-
-    def _on_app_log(self, line: str):
-        """日志总线信号：追加到日志页（启动提示占位行先清掉）"""
-        if self.log_view.toPlainText() == tr("（暂无日志）"):
-            self.log_view.clear()
-        self.log_view.append(line)
-
-    def _on_log_clear(self):
-        with _app_log_lock:
-            _app_log_lines.clear()
-        self.log_view.clear()
-        log_event("日志已清空")
-
-    def _on_log_save(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, tr("另存为…"), f"apexflight_log_"
-            f"{datetime.now():%Y%m%d_%H%M%S}.txt",
-            "日志文件 (*.txt)")
-        if not path:
-            return
+    def _save_figure_png(self, fig, prefix: str):
+        """把 matplotlib 图存成 PNG（发交流群讨论用），返回保存路径"""
         try:
-            with _app_log_lock:
-                content = "\n".join(_app_log_lines)
-            Path(path).write_text(content, encoding="utf-8")
-            self.statusBar().showMessage(f"日志已保存：{path}")
+            from datetime import datetime
+            out_dir = LOGS_DIR / "screenshots"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.png"
+            fig.savefig(path, dpi=160, facecolor=fig.get_facecolor(),
+                        bbox_inches="tight")
+            self.statusBar().showMessage(f"截图已保存：{path}", 8000)
+            log_event(f"图表截图已保存：{path}")
+            return path
         except Exception as e:
-            QMessageBox.warning(self, i18n.APP_NAME, f"保存失败：{e}")
-
-    def _open_log_folder(self):
-        """用系统文件管理器打开 logs/ 目录（app.log / crash.log / 黑匣子）"""
-        LOGS_DIR.mkdir(exist_ok=True)
-        import os
-        os.startfile(str(LOGS_DIR))
+            self.statusBar().showMessage(f"截图保存失败：{e}", 6000)
+            return None
 
     # ---------- 设置对话框（参考 BF Configurator 设置） ----------
 
@@ -1732,6 +1111,14 @@ class MainWindow(QMainWindow):
         baud_combo.addItems(["57600", "115200", "230400", "460800"])
         baud_combo.setCurrentText(self._cfg.get("baud", "115200"))
         form.addRow(tr("默认波特率") + "：", baud_combo)
+
+        # 基础单位切换（v0.99）：地图比例尺等带单位读数跟随
+        units_combo = QComboBox()
+        units_combo.addItem(tr("公制（米 / 公里）"), "metric")
+        units_combo.addItem(tr("英制（英尺 / 英里）"), "imperial")
+        units_combo.setCurrentIndex(
+            0 if self._cfg.get("units", "metric") == "metric" else 1)
+        form.addRow(tr("基础单位") + "：", units_combo)
 
         log_btn = QPushButton(tr("打开日志文件夹"))
         log_btn.clicked.connect(self._open_log_folder)
@@ -1770,15 +1157,19 @@ class MainWindow(QMainWindow):
         old_lang = i18n.get_language()
         self._cfg["language"] = lang_combo.currentData()
         self._cfg["baud"] = baud_combo.currentText()
+        self._cfg["units"] = units_combo.currentData()
         i18n.save_config(self._cfg)
         self.baud_combo.setCurrentText(self._cfg["baud"])
+        if hasattr(self, "map_widget"):
+            self.map_widget.set_units(self._cfg["units"])
         i18n.set_language(self._cfg["language"])
         self.retranslate_ui()
         if i18n.get_language() != old_lang:
             self.statusBar().showMessage(tr(
                 "语言已切换：导航与顶栏立即生效，其余界面重启后完全生效。"))
         log_event(f"设置已保存（语言={self._cfg['language']}，"
-                  f"默认波特率={self._cfg['baud']}）")
+                  f"默认波特率={self._cfg['baud']}，"
+                  f"单位={self._cfg['units']}）")
 
     FEEDBACK_URL = "https://github.com/mingwx1204/ApexFlight/issues/new"
 
@@ -1907,6 +1298,27 @@ class MainWindow(QMainWindow):
             qv.addWidget(lab)
         outer.addWidget(quick)
 
+        # ---- 机型信息备注（v0.99）：本地保存，调参讨论时随截图报配置 ----
+        craft = QGroupBox("🛩️ " + tr("机型信息备注"))
+        cf = QGridLayout(craft)
+        self._craft_edits = {}
+        craft_fields = [("名称", tr("如：5寸花飞机")), ("机架", tr("如：Mark5")),
+                        ("电机", tr("如：2207 1950KV")), ("桨叶", tr("如：51466 三叶")),
+                        ("电池", tr("如：6S 1300mAh")), ("备注", tr("自由记录"))]
+        saved_craft = self._cfg.get("craft", {})
+        for i, (key, ph) in enumerate(craft_fields):
+            lab = QLabel(tr(key) + "：")
+            edit = QLineEdit(saved_craft.get(key, ""))
+            edit.setPlaceholderText(ph)
+            self._craft_edits[key] = edit
+            row, col = divmod(i, 2)
+            cf.addWidget(lab, row, col * 2)
+            cf.addWidget(edit, row, col * 2 + 1)
+        craft_save = QPushButton("💾 " + tr("保存机型信息"))
+        craft_save.clicked.connect(self._save_craft_info)
+        cf.addWidget(craft_save, 3, 0, 1, 4)
+        outer.addWidget(craft)
+
         # ---- 三张卡片：QQ 群 / 联系作者 / 开源社区 ----
         cards = QHBoxLayout()
         cards.setSpacing(14)
@@ -1980,6 +1392,15 @@ class MainWindow(QMainWindow):
         outer.addLayout(cards)
         outer.addStretch()
         return tab
+
+    def _save_craft_info(self):
+        """机型信息备注：持久化到 config.json（本地保存，不上传）"""
+        craft = {k: e.text().strip() for k, e in self._craft_edits.items()}
+        self._cfg["craft"] = craft
+        i18n.save_config(self._cfg)
+        name = craft.get("名称") or "（未命名）"
+        self.statusBar().showMessage(f"机型信息已保存：{name}", 4000)
+        log_event(f"机型信息已保存（{name}）")
 
     # ---------- 页签 1：仪表盘 ----------
 
@@ -2090,91 +1511,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         return tab
 
-    # ---------- 页签 3：电机测试 ----------
-
-    def _build_motor_tab(self) -> QWidget:
-        """电机测试页（v0.97 参照 BF 布局重做）：
-        左侧电机位置示意图（BF QUAD X 编号、转动高亮），
-        右侧竖滑块排（µs 实时读数）+ 主控制总滑块 + 停转电机"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        # 滑块去抖定时器：拖动停止 100ms 后才真正发送 MSP_SET_MOTOR，
-        # 避免快速拖动时每动一格就起一个后台线程、几十个线程抢串口锁
-        self._motor_timer = QTimer(self)
-        self._motor_timer.setSingleShot(True)
-        self._motor_timer.setInterval(100)
-        self._motor_timer.timeout.connect(self._send_motor_values)
-        self._motor_values = {}                   # 编号 -> 当前油门 0..1
-
-        # 顶部：红色警告 + 双重安全确认（左右排布，节省纵向空间）
-        top_warn = QHBoxLayout()
-        warning = QLabel("⚠️ 危险：电机测试会让电机真实转动！\n"
-                         "使用前必须【拆下所有螺旋桨】，并确认飞机固定牢固、"
-                         "周围没有人员和杂物。")
-        warning.setStyleSheet("color: #E04545; font-weight: bold;")
-        warning.setWordWrap(True)
-        top_warn.addWidget(warning, 1)
-        checks = QVBoxLayout()
-        self.motor_check1 = QCheckBox("我已拆下所有螺旋桨")
-        self.motor_check2 = QCheckBox("我了解风险，确认开始测试")
-        self.motor_check1.stateChanged.connect(self._update_motor_lock)
-        self.motor_check2.stateChanged.connect(self._update_motor_lock)
-        checks.addWidget(self.motor_check1)
-        checks.addWidget(self.motor_check2)
-        checks.addStretch()
-        top_warn.addLayout(checks)
-        layout.addLayout(top_warn)
-
-        # 主体：左示意图 + 右滑块排
-        body = QHBoxLayout()
-
-        from apex_motor import MotorDiagramWidget
-        left_box = QGroupBox(tr("电机位置示意（编号与 BF 一致）"))
-        left_box.setMaximumWidth(340)
-        left_col = QVBoxLayout(left_box)
-        self.motor_diagram = MotorDiagramWidget()
-        left_col.addWidget(self.motor_diagram)
-        hint = QLabel(tr("转动中的电机随油门高亮"))
-        hint.setStyleSheet("color: #9AA0A6; font-size: 13px;")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_col.addWidget(hint)
-        body.addWidget(left_box, 0)
-
-        # 右侧：滑块排（连接后按实际通道数动态生成，BF 风格竖滑块）
-        self.motor_area = QGroupBox("电机输出（未连接）")
-        self.motor_layout = QHBoxLayout(self.motor_area)
-        self.motor_layout.setSpacing(12)
-        body.addWidget(self.motor_area, 1)
-        layout.addLayout(body, 1)
-
-        # 底部：停转电机（右对齐，BF 同款位置）
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-        self.motor_stop_btn = QPushButton("🛑 " + tr("停转电机"))
-        self.motor_stop_btn.setObjectName("dangerBtn")
-        self.motor_stop_btn.setEnabled(False)
-        self.motor_stop_btn.setMinimumWidth(160)
-        self.motor_stop_btn.clicked.connect(self.on_motor_stop)
-        bottom.addWidget(self.motor_stop_btn)
-        layout.addLayout(bottom)
-        return tab
-
-    # ---------- 页签 4：接收机通道 ----------
-
-    def _build_rc_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        hint = QLabel("实时显示接收机各通道数值（正常范围约 1000~2000，"
-                      "中位约 1500）。打开发射机并拨动摇杆，数值会跟着动。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        self.rc_area = QGroupBox("通道（未连接）")
-        self.rc_layout = QGridLayout(self.rc_area)
-        layout.addWidget(self.rc_area)
-        layout.addStretch()
-        return tab
-
     # ---------- 页签 5：黑匣子分析（对标 BF Blackbox Explorer）----------
 
     def _build_blackbox_tab(self) -> QWidget:
@@ -2214,7 +1550,7 @@ class MainWindow(QMainWindow):
             "清空后下次只积累新日志，下载只需几秒钟。")
         top.addWidget(self.bb_erase_toggle)
         top.addWidget(QLabel("下完清空闪存"))
-        self._flash_cancel = None             # 下载取消标志
+        # _flash_cancel 已在 __init__ 初始化（全局错误槽可能先于本页触发）
 
         self.bb_session_label = QLabel("日志段：")
         self.bb_session_label.setVisible(False)   # 多段日志时才显示
@@ -2288,6 +1624,20 @@ class MainWindow(QMainWindow):
         self.bb_normalize = QCheckBox("归一化显示（比较形状）")
         left.addWidget(self.bb_normalize)
 
+        # 日志备注标签（v0.99）：给当前日志段打标签，随文件记住
+        tag_box = QGroupBox(tr("日志备注标签"))
+        tag_col = QVBoxLayout(tag_box)
+        self.bb_tag_edit = QLineEdit()
+        self.bb_tag_edit.setPlaceholderText(
+            tr("如：柳州试飞 / 换桨后 / 抖动机架"))
+        tag_col.addWidget(self.bb_tag_edit)
+        self.bb_tag_btn = QPushButton("🏷 " + tr("保存标签"))
+        self.bb_tag_btn.setEnabled(False)
+        self.bb_tag_btn.clicked.connect(self._on_bb_tag_save)
+        tag_col.addWidget(self.bb_tag_btn)
+        left.addWidget(tag_box)
+        self._log_tags = self._load_log_tags()
+
         self.bb_plot_btn = QPushButton("🎨 绘制曲线")
         self.bb_plot_btn.setObjectName("connectBtn")
         self.bb_plot_btn.clicked.connect(self.on_bb_plot)
@@ -2298,6 +1648,13 @@ class MainWindow(QMainWindow):
         self.bb_fft_btn.clicked.connect(self.on_bb_fft)
         self.bb_fft_btn.setEnabled(False)
         left.addWidget(self.bb_fft_btn)
+
+        self.bb_shot_btn = QPushButton("📷 " + tr("保存截图"))
+        self.bb_shot_btn.setToolTip(
+            tr("把当前图表存为 PNG，方便发到交流群讨论"))
+        self.bb_shot_btn.clicked.connect(
+            lambda: self._save_figure_png(self.bb_figure, "blackbox"))
+        left.addWidget(self.bb_shot_btn)
 
         self.bb_ai_btn = QPushButton("🤖 AI 解读图表")
         self.bb_ai_btn.setToolTip(
@@ -2453,21 +1810,76 @@ class MainWindow(QMainWindow):
             self.on_error(f"日志读取失败：{e}")
 
     def _setup_session_combo(self):
-        """根据日志段数量更新下拉框（单段时隐藏）"""
+        """根据日志段数量更新下拉框（单段时隐藏），条目附备注标签"""
         self.bb_session_combo.blockSignals(True)
         self.bb_session_combo.clear()
         for i, csv_path in enumerate(self.bb_sessions):
-            self.bb_session_combo.addItem(f"第 {i + 1} 段（{csv_path.name}）")
+            tag = self._log_tags.get(csv_path.name, "")
+            suffix = f" 🏷{tag}" if tag else ""
+            self.bb_session_combo.addItem(
+                f"第 {i + 1} 段（{csv_path.name}）{suffix}")
         multi = len(self.bb_sessions) > 1
         self.bb_session_combo.setVisible(multi)
         self.bb_session_label.setVisible(multi)
         self.bb_session_combo.blockSignals(False)
+        self._sync_tag_edit()
+
+    # ---- 日志备注标签（v0.99）----
+
+    def _load_log_tags(self) -> dict:
+        """读取 logs/log_tags.json（文件名 → 备注标签）"""
+        import json as _json
+        try:
+            p = LOGS_DIR / "log_tags.json"
+            if p.exists():
+                return _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_log_tags(self):
+        import json as _json
+        try:
+            (LOGS_DIR / "log_tags.json").write_text(
+                _json.dumps(self._log_tags, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except Exception as e:
+            self.statusBar().showMessage(f"标签保存失败：{e}", 5000)
+
+    def _current_bb_name(self) -> str:
+        idx = self.bb_session_combo.currentIndex()
+        if 0 <= idx < len(self.bb_sessions):
+            return Path(self.bb_sessions[idx]).name
+        return ""
+
+    def _sync_tag_edit(self):
+        """切日志段/新加载时：标签编辑框跟随当前段"""
+        name = self._current_bb_name()
+        if hasattr(self, "bb_tag_edit"):
+            self.bb_tag_edit.setText(self._log_tags.get(name, ""))
+            self.bb_tag_btn.setEnabled(bool(name))
+
+    def _on_bb_tag_save(self):
+        name = self._current_bb_name()
+        if not name:
+            return
+        tag = self.bb_tag_edit.text().strip()
+        if tag:
+            self._log_tags[name] = tag
+        else:
+            self._log_tags.pop(name, None)
+        self._save_log_tags()
+        self._setup_session_combo()           # 刷新下拉条目上的标签
+        self.statusBar().showMessage(
+            f"标签已保存：{name} → {tag or '（已清除）'}", 4000)
+        log_event(f"日志标签：{name} → {tag or '（清除）'}")
 
     def on_bb_session_changed(self, index: int):
         """切换日志段"""
         if 0 <= index < len(self.bb_sessions):
             try:
                 self._load_blackbox_file(self.bb_sessions[index])
+                self._sync_tag_edit()
             except Exception as e:
                 self.on_error(f"加载第 {index + 1} 段日志失败：{e}")
 
@@ -3512,6 +2924,10 @@ class MainWindow(QMainWindow):
         self.ai_send_btn.clicked.connect(self.on_ai_send)
         input_row.addWidget(self.ai_send_btn)
         layout.addLayout(input_row)
+        # 懒加载：探测结果可能在页面构建前就到了，先缓存再应用
+        cache = getattr(self, "_ai_probe_cache", None)
+        if cache is not None:
+            self._apply_ai_probe(*cache)
         return tab
 
     # ---------- AI 助手：状态检测 ----------
@@ -3522,7 +2938,14 @@ class MainWindow(QMainWindow):
         self.ai_probe_done.emit(running, models)
 
     def on_ai_probe(self, running: bool, models: list):
-        """界面线程：根据探测结果刷新状态行和模型下拉框"""
+        """界面线程：缓存探测结果；AI 页已构建则立即刷新，
+        未构建（懒加载）则等首次进入时由构建器应用（v0.99）"""
+        self._ai_probe_cache = (running, models)
+        if self._page_built[9]:               # 9 = AI 助手页
+            self._apply_ai_probe(running, models)
+
+    def _apply_ai_probe(self, running: bool, models: list):
+        """根据探测结果刷新状态行和模型下拉框"""
         self.ai_model_combo.blockSignals(True)
         self.ai_model_combo.clear()
         if running:
@@ -3548,8 +2971,11 @@ class MainWindow(QMainWindow):
         self.ai_model_combo.blockSignals(False)
 
     def on_ai_refresh(self):
-        self.ai_status_label.setText("检测中……")
-        self.ai_status_label.setStyleSheet("")
+        # 懒加载：AI 页未构建时没有状态行，只在后台探测；
+        # 结果由 on_ai_probe 缓存，首次进入 AI 页时应用（v0.99）
+        if self._page_built[9]:
+            self.ai_status_label.setText("检测中……")
+            self.ai_status_label.setStyleSheet("")
         self._run_in_thread(self._ai_probe_and_emit)
 
     # ---------- AI 助手：按本机性能匹配模型（v0.96）----------
@@ -3691,6 +3117,10 @@ class MainWindow(QMainWindow):
 
     def on_ai_analyze_bb(self):
         """快捷按钮：把黑匣子统计结果发给 AI"""
+        if not self._page_built[6]:
+            self.statusBar().showMessage(
+                "请先在「黑匣子」页加载一段日志，再来让 AI 分析")
+            return
         stats = self.bb_stats_label.text().strip()
         if not stats:
             self.statusBar().showMessage(
@@ -3741,17 +3171,19 @@ class MainWindow(QMainWindow):
                 f"{f['notch_min']}-{f['notch_max']}Hz Q={f['notch_q']}，"
                 f"RPM 滤波 谐波 {f['rpm_harmonics']} 最低 "
                 f"{f['rpm_min_hz']}Hz")
-        if self.bb_time:
+        bb_time = getattr(self, "bb_time", None)   # 黑匣子页可能尚未构建
+        if bb_time:
             stats = analyze_blackbox_stats(
-                self.bb_time, self.bb_data, self.bb_columns)
+                bb_time, self.bb_data, self.bb_columns)
             if stats:
                 block = "【黑匣子分析】\n" + "\n".join(
                     f"{k}：{v}" for k, v in stats.items())
-                if self.bb_log_type:
-                    block += (f"\n日志类型判别：{self.bb_log_type['verdict']}"
-                              f"（置信度 {self.bb_log_type['confidence']}%）\n"
+                bb_log_type = getattr(self, "bb_log_type", None)
+                if bb_log_type:
+                    block += (f"\n日志类型判别：{bb_log_type['verdict']}"
+                              f"（置信度 {bb_log_type['confidence']}%）\n"
                               + "\n".join("· " + r for r in
-                                          self.bb_log_type["reasons"]))
+                                          bb_log_type["reasons"]))
                 parts.append(block)
         return "\n\n".join(parts)
 
@@ -4262,6 +3694,7 @@ class MainWindow(QMainWindow):
         self.worker.backup_done.connect(
             lambda p: self.statusBar().showMessage(f"已自动备份：{p}"))
         self.worker.motor_count_ready.connect(self.on_motor_count)
+        self.worker.motor_values_ready.connect(self.on_motor_values)
         self.worker.flash_progress.connect(self.statusBar().showMessage)
         self.worker.flash_done.connect(self.on_flash_done)
         self.worker.tuning_ready.connect(self.on_tuning_ready)
@@ -4272,6 +3705,8 @@ class MainWindow(QMainWindow):
         self.ai.done.connect(self.on_ai_done)
         self.ai.failed.connect(self.on_ai_failed)
         self.ai_probe_done.connect(self.on_ai_probe)
+        # v0.99：简单后台任务完成派发（信号队列保证不被重负载事件流饿死）
+        self.task_result_ready.connect(self._simple_task_dispatch)
 
     def _run_in_thread(self, func, *args):
         """通用后台线程启动器（顺手清理已结束的线程引用，防止列表无限增长）"""
@@ -4369,7 +3804,8 @@ class MainWindow(QMainWindow):
                     self.rates_reload_btn, self.filter_reload_btn,
                     self.preset_save_btn, self.preset_apply_btn):
             btn.setEnabled(True)
-        self.bb_flash_btn.setEnabled(True)    # 连接后允许从飞控下载黑匣子
+        if self._page_built[6]:               # 黑匣子页可能尚未构建（懒加载）
+            self.bb_flash_btn.setEnabled(True)   # 连接后允许从飞控下载黑匣子
         self.poll_timer.start()               # 开始慢通道轮询
         self.fast_timer.start()               # 开始快通道轮询（姿态 10 帧/秒）
 
@@ -4438,16 +3874,13 @@ class MainWindow(QMainWindow):
                                   else "无（可以解锁）")
 
     def on_fast_ready(self, data: dict):
-        """快通道数据到达：更新人工地平线和接收机通道"""
+        """快通道数据到达：更新人工地平线"""
         attitude = data.get("attitude")
         if attitude:
             roll, pitch, yaw = attitude
             self.horizon.set_attitude(roll, pitch)
             self.attitude_label.setText(
                 f"横滚 {roll:.1f}° ｜ 俯仰 {pitch:.1f}° ｜ 航向 {yaw:.0f}°")
-        rc = data.get("rc", [])
-        if rc:
-            self._update_rc_display(rc)
 
     def on_write_done(self, message: str):
         self.statusBar().showMessage(message.splitlines()[0])
@@ -4455,73 +3888,12 @@ class MainWindow(QMainWindow):
         log_event(message.splitlines()[0])
         QMessageBox.information(self, "ApexFlight", message)
 
-    def on_motor_count(self, count: int):
-        """根据电机通道数动态生成 BF 风格竖滑块排 + 主控制总滑块"""
-        self._motor_count = count
-        self.motor_area.setTitle(f"电机输出（{count} 个通道）")
-        self.motor_diagram.set_motor_count(count)
-        # 清空旧滑块（含子布局里的列）
-        while self.motor_layout.count():
-            item = self.motor_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.layout():
-                while item.layout().count():
-                    sub = item.layout().takeAt(0)
-                    if sub.widget():
-                        sub.widget().deleteLater()
-        self._motor_sliders = []
-        self._motor_values = {}
-        for i in range(count):
-            col = QVBoxLayout()
-            val_label = QLabel("0")
-            val_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            val_label.setStyleSheet("color: #3EC6E8; font-size: 15px;")
-            slider = QSlider(Qt.Orientation.Vertical)
-            slider.setRange(0, 1000)          # 0=停转，否则输出 1000+value µs
-            slider.setMinimumHeight(190)
-            slider.setEnabled(False)
-            slider.valueChanged.connect(
-                lambda v, idx=i, lab=val_label:
-                self._on_motor_slider(idx, v, lab))
-            num_label = QLabel(str(i + 1))
-            num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            num_label.setStyleSheet("font-weight: bold; font-size: 16px;")
-            col.addWidget(val_label)
-            col.addWidget(slider, 1, Qt.AlignmentFlag.AlignHCenter)
-            col.addWidget(num_label)
-            self.motor_layout.addLayout(col)
-            self._motor_sliders.append((val_label, slider))
-        # 分隔线 + 主控制（BF 同款：一个总滑块同时驱动全部电机）
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.VLine)
-        line.setStyleSheet("color: #3A3F47;")
-        self.motor_layout.addWidget(line)
-        mcol = QVBoxLayout()
-        self.motor_master_label = QLabel("0")
-        self.motor_master_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.motor_master_label.setStyleSheet(
-            "color: #F5A83D; font-size: 15px;")
-        self.motor_master = QSlider(Qt.Orientation.Vertical)
-        self.motor_master.setRange(0, 1000)
-        self.motor_master.setMinimumHeight(190)
-        self.motor_master.setEnabled(False)
-        self.motor_master.valueChanged.connect(self._on_master_slider)
-        mname = QLabel(tr("主控制"))
-        mname.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mname.setStyleSheet("font-weight: bold; font-size: 16px;")
-        mcol.addWidget(self.motor_master_label)
-        mcol.addWidget(self.motor_master, 1, Qt.AlignmentFlag.AlignHCenter)
-        mcol.addWidget(mname)
-        self.motor_layout.addLayout(mcol)
-        self.motor_layout.addStretch()
-        self._update_motor_lock()
-
     def on_error(self, message: str):
         # 闪存下载失败/被取消时：恢复按钮文字和轮询定时器
         if self._flash_cancel is not None:
             self._flash_cancel = None
-            self.bb_flash_btn.setText("📥 从飞控下载")
+            if self._page_built[6]:           # 黑匣子页可能尚未构建
+                self.bb_flash_btn.setText("📥 从飞控下载")
             self._resume_polling_after_flash()
         self.statusBar().showMessage(f"错误：{message.splitlines()[0]}")
         log_event(f"错误：{message.splitlines()[0]}")
@@ -4592,86 +3964,6 @@ class MainWindow(QMainWindow):
 
     # ---------- 电机测试页操作 ----------
 
-    def _update_motor_lock(self):
-        """只有两个安全确认都勾选且已连接，滑块才能用"""
-        unlocked = (self.motor_check1.isChecked()
-                    and self.motor_check2.isChecked()
-                    and self.worker.is_connected)
-        for _, slider in self._motor_sliders:
-            slider.setEnabled(unlocked)
-        if hasattr(self, "motor_master"):
-            self.motor_master.setEnabled(unlocked)
-        self.motor_stop_btn.setEnabled(unlocked)
-
-    def _on_motor_slider(self, index: int, value: int, label: QLabel):
-        """滑块变化：µs 读数 + 示意图高亮 + 重启去抖定时器"""
-        label.setText("0" if value == 0 else str(1000 + value))
-        self._motor_values[index + 1] = value / 1000.0
-        self.motor_diagram.set_values(self._motor_values)
-        self._motor_timer.start()
-
-    def _on_master_slider(self, value: int):
-        """主控制：把所有电机滑块拉到同一值（各滑块自己去抖发送）"""
-        self.motor_master_label.setText("0" if value == 0
-                                        else str(1000 + value))
-        for _, slider in self._motor_sliders:
-            slider.setValue(value)      # 触发各自 _on_motor_slider
-
-    def _send_motor_values(self):
-        """去抖定时器触发：把当前全部滑块值发给飞控。
-        滑块 0 = 停转（发 0），其余按 BF 惯例映射为 1000+value（µs）。"""
-        values = []
-        for _, s in self._motor_sliders:
-            v = s.value()
-            values.append(0 if v == 0 else 1000 + v)
-        # 补齐到 8 个通道（协议固定 8 个电机）
-        values += [0] * (8 - len(values))
-        self._run_in_thread(self.worker.set_motor_values, values[:8])
-
-    def on_motor_stop(self):
-        """停转电机：所有滑块（含主控制）归零"""
-        for _, slider in self._motor_sliders:
-            slider.setValue(0)
-        if hasattr(self, "motor_master"):
-            self.motor_master.setValue(0)
-
-    def _stop_motors_safely(self):
-        """断开/关闭前尝试把所有电机停掉"""
-        if self.worker.is_connected and self._motor_count:
-            try:
-                set_motors(self.worker.serial_port, [0] * 8)
-            except Exception:
-                pass
-
-    # ---------- 接收机页 ----------
-
-    def _update_rc_display(self, channels: list):
-        """按通道数动态生成/更新接收机通道显示"""
-        if len(self._rc_bars) != len(channels):
-            # 通道数变化（首次连接）时重建
-            while self.rc_layout.count():
-                item = self.rc_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            self._rc_bars = []
-            self.rc_area.setTitle(f"通道（{len(channels)} 个）")
-            for i in range(len(channels)):
-                name = QLabel(f"CH {i + 1}")
-                value = QLabel("0")
-                value.setMinimumWidth(50)
-                bar = QSlider(Qt.Orientation.Horizontal)
-                bar.setRange(800, 2200)
-                bar.setEnabled(False)         # 只读显示条
-                row = i // 2
-                col = (i % 2) * 3
-                self.rc_layout.addWidget(name, row, col)
-                self.rc_layout.addWidget(bar, row, col + 1)
-                self.rc_layout.addWidget(value, row, col + 2)
-                self._rc_bars.append((bar, value))
-        for (bar, value_label), v in zip(self._rc_bars, channels):
-            bar.setValue(max(800, min(2200, v)))
-            value_label.setText(str(v))
-
     # ---------- 断开与关闭 ----------
 
     def _set_disconnected_ui(self):
@@ -4688,7 +3980,8 @@ class MainWindow(QMainWindow):
         self._filter_raw = None
         self._compat = None
         self.compat_label.setVisible(False)
-        self.bb_flash_btn.setEnabled(False)
+        if self._page_built[6]:               # 黑匣子页可能尚未构建（懒加载）
+            self.bb_flash_btn.setEnabled(False)
         self.firmware_label.setText("未连接")
         self.board_label.setText("未连接")
         self.motors_label.setText("未连接")
