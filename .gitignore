@@ -1,0 +1,43 @@
+# ---- Python 编译缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 打包/分发 ----
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ---- 测试/覆盖率 ----
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- IDE 配置 ----
+.vscode/
+.idea/
+*.swp
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 项目数据（黑匣子日志等较大文件不入库） ----
+logs/
+*.bbl
+*.bfl
+*.blackbox
+
+# ---- 本地工具安装包（体积大，不入库） ----
+tools/*.exe
+
+# ---- 开发调试脚本（不上库） ----
+src/_*.py

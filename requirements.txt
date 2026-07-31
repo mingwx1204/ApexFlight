@@ -1,0 +1,6 @@
+# ApexFlight 依赖列表
+# 安装命令：pip install -r requirements.txt
+
+PyQt6>=6.4.0        # GUI 界面框架
+pyserial>=3.5       # 串口通信（与飞控连接）
+matplotlib>=3.7     # 黑匣子曲线绘制与频谱分析（可选，未装时黑匣子页不可用）
