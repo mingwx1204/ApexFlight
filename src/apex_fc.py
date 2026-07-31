@@ -26,13 +26,17 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # ============================================================
 
 def query_flight_controller(ser: serial.Serial) -> dict:
-    """查询飞控基本信息：固件版本、板子型号、机型/电机。"""
-    info = {"firmware": "未知", "board": "未知", "motors": "未知"}
+    """查询飞控基本信息：固件版本、板子型号、机型/电机。
+    额外附带结构化字段：variant（固件代号如 BTFL）、version_tuple（版本元组），
+    供 compatibility_report 做适配判断。"""
+    info = {"firmware": "未知", "board": "未知", "motors": "未知",
+            "variant": "", "version_tuple": None}
 
     # 固件版本（3 字节：主.次.修订）
     try:
         data = msp_request(ser, MSP_FC_VERSION)
         if len(data) >= 3:
+            info["version_tuple"] = (data[0], data[1], data[2])
             info["firmware"] = f"Betaflight {data[0]}.{data[1]}.{data[2]}"
     except MspError:
         pass
@@ -40,7 +44,8 @@ def query_flight_controller(ser: serial.Serial) -> dict:
     # 固件名称确认（应为 "BTFL"）
     try:
         data = msp_request(ser, MSP_FC_VARIANT)
-        variant = data[:4].decode("ascii", errors="replace")
+        variant = data[:4].decode("ascii", errors="replace").strip("\x00 ")
+        info["variant"] = variant
         if variant != "BTFL":
             info["firmware"] += f"（注意：检测到固件为 {variant}）"
     except MspError:
@@ -85,6 +90,106 @@ def query_flight_controller(ser: serial.Serial) -> dict:
         except MspError:
             pass
     return info
+
+
+# ------------------------------------------------------------
+# 兼容性评估（v0.8）：不同固件 / 不同版本的适配策略
+# ------------------------------------------------------------
+# 已知固件代号（MSP_FC_VARIANT 返回的 4 字符）
+KNOWN_VARIANTS = {
+    "BTFL": "Betaflight",
+    "INAV": "INAV",
+    "CLFL": "Cleanflight",
+    "QUIC": "QUIC",
+    "EMUF": "EmuFlight",
+    "RHFL": "Rotorflight",
+}
+
+
+def parse_fc_version(text: str) -> tuple | None:
+    """从 'Betaflight 4.5.2' 之类的字符串解析版本元组 (4, 5, 2)，失败返回 None"""
+    import re
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)),
+            int(m.group(3)) if m.group(3) else 0)
+
+
+def compatibility_report(info: dict) -> dict:
+    """根据固件变体和版本评估本软件与这块飞控的兼容程度。
+
+    返回 {
+        level: "full"（完全支持）/ "limited"（受限）/ "unknown"（未知）,
+        block_writes: 是否锁定 BF 专属布局的写入（Rates/滤波/预设应用）,
+        messages: 给用户看的中文提示列表,
+        features: 各功能可用性,
+    }
+
+    适配原则：
+    - 非 Betaflight 固件（INAV/Cleanflight/QUIC 等）：MSP 核心命令通用，
+      PID/电机/仪表可用；但 RC_TUNING 23 字节、FILTER_CONFIG 49 字节是
+      Betaflight 私有布局，写入可能破坏配置 → 只读保护。
+    - Betaflight 4.4+：布局已逐字段验证，完全支持。
+    - Betaflight 4.2/4.3：布局接近但未完整验证，允许写入但给出提醒。
+    - Betaflight < 4.2：布局不同，只读保护。
+    """
+    variant = info.get("variant", "") or parse_fc_variant_from_text(
+        info.get("firmware", ""))
+    version = info.get("version_tuple") or parse_fc_version(
+        info.get("firmware", ""))
+    features = {"pid": True, "rates": True, "filter": True,
+                "blackbox": True, "motors": True, "presets": True}
+
+    if variant and variant != "BTFL":
+        name = KNOWN_VARIANTS.get(variant, variant)
+        features.update({"rates": False, "filter": False, "presets": False})
+        return {
+            "level": "limited", "block_writes": True,
+            "messages": [
+                f"检测到 {name} 固件：本软件按 Betaflight 协议开发，"
+                "仪表盘、PID、电机测试可用；",
+                "Rates 与滤波器的字节布局是该固件私有格式，"
+                "已切换为只读保护（可查看，保存按钮已锁定）。",
+            ],
+            "features": features,
+        }
+
+    if version is None:
+        return {
+            "level": "unknown", "block_writes": False,
+            "messages": ["未能识别固件版本：功能将照常尝试，"
+                         "执行写入操作前建议先做备份。"],
+            "features": features,
+        }
+
+    major, minor = version[0], version[1]
+    if (major, minor) >= (4, 4):
+        return {"level": "full", "block_writes": False,
+                "messages": [], "features": features}
+    if (major, minor) >= (4, 2):
+        return {
+            "level": "limited", "block_writes": False,
+            "messages": [f"Betaflight {major}.{minor} 未经完整验证"
+                         "（本软件按 4.4+ 协议逐字段核对），"
+                         "如写入后手感异常请用自动备份恢复。"],
+            "features": features,
+        }
+    features.update({"rates": False, "filter": False, "presets": False})
+    return {
+        "level": "limited", "block_writes": True,
+        "messages": [f"Betaflight {major}.{minor} 版本较旧：Rates/滤波器布局"
+                     "与 4.4+ 不同，已切换为只读保护。"],
+        "features": features,
+    }
+
+
+def parse_fc_variant_from_text(text: str) -> str:
+    """从显示文本（如 'Betaflight 4.5.2（注意：检测到固件为 INAV）'）提取固件代号"""
+    for code in KNOWN_VARIANTS:
+        if code in text:
+            return code
+    return ""
 
 
 def query_pid(ser: serial.Serial) -> tuple:
@@ -157,19 +262,34 @@ RC_FIELD_OFFSETS = {
 
 
 def parse_rc_tuning(raw: bytes) -> dict:
-    """把 23 字节原始数据解析成可读字典（比例值已除以 100）"""
-    if len(raw) < 23:
-        raise MspError(f"Rates 数据长度异常：实际 {len(raw)} 字节（需 23）")
-    return {
-        "rc_rate": [raw[0] / 100, raw[12] / 100, raw[11] / 100],  # R, P, Y
-        "expo":    [raw[1] / 100, raw[13] / 100, raw[10] / 100],
-        "rate":    [raw[2] / 100, raw[3] / 100, raw[4] / 100],
-        "thr_mid": raw[6] / 100,
-        "thr_expo": raw[7] / 100,
-        "thr_limit_pct": raw[15],
-        "rate_limit": [u16(raw, 16), u16(raw, 18), u16(raw, 20)],
-        "rates_type": raw[22],
+    """把 RC_TUNING 原始数据解析成可读字典（比例值已除以 100）。
+
+    适配策略（v0.8）：Betaflight 4.4+ 返回 23 字节；更老/其他固件可能更短。
+    短数据不再直接报错，而是按可得字节解析、缺失字段填安全默认值，
+    并标记 "partial": True 让界面提示"该固件数据不完整，仅供参考"。"""
+    if len(raw) < 8:
+        raise MspError(f"Rates 数据长度异常：实际 {len(raw)} 字节（至少需 8）")
+    partial = len(raw) < 23
+
+    def b(i: int, default: int = 0) -> int:
+        return raw[i] if i < len(raw) else default
+
+    def w(i: int, default: int = 0) -> int:
+        return u16(raw, i) if i + 2 <= len(raw) else default
+
+    result = {
+        "rc_rate": [b(0, 100) / 100, b(12, 100) / 100, b(11, 100) / 100],
+        "expo":    [b(1) / 100, b(13) / 100, b(10) / 100],
+        "rate":    [b(2, 70) / 100, b(3, 70) / 100, b(4, 70) / 100],
+        "thr_mid": b(6, 50) / 100,
+        "thr_expo": b(7) / 100,
+        "thr_limit_pct": b(15, 100),
+        "rate_limit": [w(16, 1998), w(18, 1998), w(20, 1998)],
+        "rates_type": b(22, 0),
     }
+    if partial:
+        result["partial"] = True
+    return result
 
 
 def set_rc_value(raw: bytearray, field: str, axis: int, value: float):
@@ -261,12 +381,20 @@ def write_filter_config(ser: serial.Serial, raw: bytes,
 
 
 def parse_filter_config(raw: bytes) -> dict:
-    """把滤波器原始数据解析成 {键名: 整数值}"""
-    if len(raw) < 49:
-        raise MspError(f"滤波器数据长度异常：实际 {len(raw)} 字节（需 49）")
+    """把滤波器原始数据解析成 {键名: 整数值}。
+
+    适配策略（v0.8）：Betaflight 4.4+ 返回 49 字节；短数据容错解析——
+    超出长度的字段填 0 并标记 "partial": True，不再整体报错。"""
+    if len(raw) < 8:
+        raise MspError(f"滤波器数据长度异常：实际 {len(raw)} 字节（至少需 8）")
     result = {}
     for key, _name, offset, kind, _lo, _hi in FILTER_FIELDS:
-        result[key] = u16(raw, offset) if kind == "u16" else raw[offset]
+        if kind == "u16":
+            result[key] = u16(raw, offset) if offset + 2 <= len(raw) else 0
+        else:
+            result[key] = raw[offset] if offset < len(raw) else 0
+    if len(raw) < 49:
+        result["partial"] = True
     return result
 
 

@@ -163,13 +163,28 @@ _MSP_LOCK = threading.Lock()
 
 
 def msp_request(ser: serial.Serial, cmd: int, payload: bytes = b"",
-                timeout: float = 2.0) -> bytes:
-    """发送一条 MSP 命令并等待响应（线程安全，全程持锁）。"""
+                timeout: float = 2.0, retries: int = 1) -> bytes:
+    """发送一条 MSP 命令并等待响应（线程安全，全程持锁）。
+
+    retries：瞬态错误（超时、帧损坏）自动重试次数，默认 1（即共尝试 2 次）。
+    USB 转串口在飞控刚上电、总线繁忙时会偶发丢字节，重试一次可显著减少
+    偶发"读取超时"误报。飞控明确拒绝的命令（固件不支持）不重试。
+    """
     with _MSP_LOCK:
-        ser.reset_input_buffer()              # 丢弃缓冲区里的旧数据
-        ser.write(build_msp_request(cmd, payload))
-        ser.flush()
-        return read_msp_response(ser, cmd, timeout)
+        last_err: MspError | None = None
+        for attempt in range(retries + 1):
+            try:
+                ser.reset_input_buffer()          # 丢弃缓冲区里的旧数据
+                ser.write(build_msp_request(cmd, payload))
+                ser.flush()
+                return read_msp_response(ser, cmd, timeout)
+            except MspError as e:
+                if str(e).startswith("飞控拒绝了命令"):
+                    raise                         # 确定性失败，重试无意义
+                last_err = e
+                if attempt < retries:
+                    time.sleep(0.05)
+        raise last_err
 
 
 # ============================================================
@@ -245,13 +260,24 @@ def read_msp2_response(ser: serial.Serial, expected_cmd: int,
 
 
 def msp2_request(ser: serial.Serial, cmd: int, payload: bytes = b"",
-                 timeout: float = 5.0) -> bytes:
-    """发送一条 MSP v2 命令并等待响应（与 v1 共用同一把串口锁）。"""
+                 timeout: float = 5.0, retries: int = 1) -> bytes:
+    """发送一条 MSP v2 命令并等待响应（与 v1 共用同一把串口锁）。
+    瞬态错误自动重试（规则同 msp_request）。"""
     with _MSP_LOCK:
-        ser.reset_input_buffer()
-        ser.write(build_msp2_request(cmd, payload))
-        ser.flush()
-        return read_msp2_response(ser, cmd, timeout)
+        last_err: MspError | None = None
+        for attempt in range(retries + 1):
+            try:
+                ser.reset_input_buffer()
+                ser.write(build_msp2_request(cmd, payload))
+                ser.flush()
+                return read_msp2_response(ser, cmd, timeout)
+            except MspError as e:
+                if str(e).startswith("飞控拒绝了命令"):
+                    raise
+                last_err = e
+                if attempt < retries:
+                    time.sleep(0.05)
+        raise last_err
 
 
 def u16(data: bytes, offset: int) -> int:

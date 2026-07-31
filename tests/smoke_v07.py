@@ -85,6 +85,23 @@ except Exception as e:
     failed += 1
     print(f"  💥 AI 入口: {e}")
 
+# 7. v0.8：模拟接入 INAV 飞控 → 兼容提示条出现、写入按钮锁定
+win.on_connected({"firmware": "Betaflight 4.5.2（注意：检测到固件为 INAV）",
+                  "board": "TEST", "motors": "4 个电机通道",
+                  "variant": "INAV", "version_tuple": (7, 1, 0)})
+app.processEvents()
+check("INAV 接入显示兼容提示条", not win.compat_label.isHidden())
+check("INAV 接入锁定 Rates 写入", not win.rates_write_btn.isEnabled())
+check("INAV 接入锁定滤波写入", not win.filter_write_btn.isEnabled())
+check("INAV 接入锁定预设应用", not win.preset_apply_btn.isEnabled())
+
+# 8. v0.8：模拟接入 BF 4.5.2 → 无提示条、完全支持
+win.on_connected({"firmware": "Betaflight 4.5.2", "board": "TEST",
+                  "motors": "4 个电机通道",
+                  "variant": "BTFL", "version_tuple": (4, 5, 2)})
+app.processEvents()
+check("BF 4.5 接入无兼容提示", not win.compat_label.isVisible())
+
 win.close()
 print(f"\n{'全部通过' if failed == 0 else str(failed) + ' 项失败'}")
 sys.exit(1 if failed else 0)

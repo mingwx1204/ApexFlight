@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 ApexFlight —— 开源无人机调参软件
-v0.7：实时仪表盘 + PID/Rates/滤波在线调参 + 调参方案管理
+v0.8：实时仪表盘 + PID/Rates/滤波在线调参 + 调参方案管理
       + 电机测试 + 接收机监视 + 黑匣子分析（闪存下载/频谱/双日志对比）
       + 日志类型智能判别（飞行 vs 地面空转）+ 本地 AI 助手（Ollama）
+      + 全面兼容适配（固件变体识别 / 版本分级 / 容错解析 / 环境自检）
 
 代码结构（v0.7 起按职责拆分）：
     apex_msp.py      MSP 协议编解码（v1/v2 帧、CRC8）
@@ -26,18 +27,33 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import serial
-from serial.tools import list_ports
+# v0.8：依赖自检 —— 缺 PyQt6/pyserial 时给出可读提示而不是一堆 traceback
+try:
+    import serial
+    from serial.tools import list_ports
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PyQt6.QtWidgets import (
-    QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QLineEdit, QVBoxLayout, QWidget,
-)
+    from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+    from PyQt6.QtGui import (
+        QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap)
+    from PyQt6.QtWidgets import (
+        QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+        QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+        QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+        QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
+        QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QLineEdit,
+        QVBoxLayout, QWidget)
+except ImportError as _dep_err:
+    print("=" * 56)
+    print(f"  缺少运行依赖：{_dep_err.name}")
+    print("  请先在项目目录执行：")
+    print("      pip install -r requirements.txt")
+    print("  （或单独安装：pip install PyQt6 pyserial matplotlib）")
+    print("=" * 56)
+    try:
+        input("按回车键退出……")
+    except EOFError:
+        pass
+    raise SystemExit(1)
 
 # matplotlib 用于黑匣子曲线绘制（嵌入式画布）；未安装时黑匣子页给出提示
 try:
@@ -129,11 +145,26 @@ class SerialWorker(QObject):
             self.status.emit("就绪")
 
         except serial.SerialException as e:
-            self.error.emit(f"无法打开串口 {port}：{e}\n请确认没有其他程序"
-                            "（如 Betaflight Configurator）占用该串口。")
+            # v0.8：按错误类型给出可操作的排查提示
+            detail = str(e)
+            if "PermissionError" in detail or "拒绝访问" in detail \
+                    or "Access is denied" in detail:
+                hint = ("串口被占用：请关闭 Betaflight Configurator / "
+                        "其他地面站和串口工具后重试。")
+            elif "FileNotFoundError" in detail or "找不到指定" in detail \
+                    or "cannot find" in detail.lower():
+                hint = "串口不存在：飞控可能已拔出，重新插拔 USB 后点「刷新」。"
+            else:
+                hint = ("请确认已安装飞控驱动（STM32 VCP / CP210x / CH340），"
+                        "并换一个 USB 口试试。")
+            self.error.emit(f"无法打开串口 {port}\n{hint}\n（{detail}）")
             self.close_port()
         except MspError as e:
-            self.error.emit(f"MSP 通信失败：{e}")
+            hint = ""
+            if "超时" in str(e):
+                hint = ("\n设备无响应：确认选的是飞控（而非蓝牙/调试器串口），"
+                        "波特率保持 115200；刚插上 USB 可等 2 秒再连。")
+            self.error.emit(f"MSP 通信失败：{e}{hint}")
             self.close_port()
         except Exception as e:
             self.error.emit(f"发生未知错误：{e}")
@@ -798,6 +829,15 @@ class MainWindow(QMainWindow):
         form.addRow("飞控型号：", self.board_label)
         form.addRow("机型/电机：", self.motors_label)
         left.addWidget(info_box)
+
+        # 兼容性提示条（v0.8）：非 BF 固件 / 未验证版本时显示，平时隐藏
+        self.compat_label = QLabel("")
+        self.compat_label.setWordWrap(True)
+        self.compat_label.setVisible(False)
+        self.compat_label.setStyleSheet(
+            "QLabel { background: #3D2E12; color: #F5C542; "
+            "border: 1px solid #8A6D1F; border-radius: 6px; padding: 8px; }")
+        left.addWidget(self.compat_label)
 
         power_box = QGroupBox("电源 / 链路")
         form2 = QFormLayout(power_box)
@@ -1738,13 +1778,19 @@ class MainWindow(QMainWindow):
             self.thr_limit_spin.setValue(parsed["thr_limit_pct"])
             self.thr_limit_spin.blockSignals(False)
             self._draw_rates_curve()
+            if parsed.get("partial"):
+                self.statusBar().showMessage(
+                    "注意：该固件返回的 Rates 数据不完整，"
+                    "缺失字段已用默认值显示，请勿从此页写入")
             # 安全保护：固件使用 Actual/Quick/Raceflight 等非经典 Rates 类型时，
             # 数值含义不同，从此页写入可能破坏手感配置 → 禁止写入，只允许看
             classic = parsed.get("rates_type", 0) == 0
-            self.rates_write_btn.setEnabled(classic)
+            allowed = classic and not parsed.get("partial") \
+                and self._compat_allows("rates")
+            self.rates_write_btn.setEnabled(allowed)
             self.rates_write_btn.setToolTip(
-                "" if classic else
-                "固件使用非经典 Rates 类型，为安全起见禁止从此页写入")
+                "" if allowed else
+                "该固件 Rates 配置未完全适配，为安全起见禁止从此页写入")
         except (MspError, KeyError, TypeError):
             self._rc_raw = None
             self.rates_write_btn.setEnabled(False)
@@ -1769,7 +1815,14 @@ class MainWindow(QMainWindow):
                 toggle.blockSignals(False)
                 for w in widgets:
                     w.setEnabled(enabled)
-            self.filter_write_btn.setEnabled(True)
+            if values.get("partial"):
+                self.statusBar().showMessage(
+                    "注意：该固件返回的滤波器数据不完整，仅供参考")
+            self.filter_write_btn.setEnabled(
+                not values.get("partial") and self._compat_allows("filter"))
+            self.filter_write_btn.setToolTip(
+                "" if self.filter_write_btn.isEnabled() else
+                "该固件滤波器配置未完全适配，已锁定写入（只读）")
         except (MspError, KeyError, TypeError):
             self._filter_raw = None
             self.filter_write_btn.setEnabled(False)
@@ -2569,7 +2622,38 @@ class MainWindow(QMainWindow):
         self.bb_flash_btn.setEnabled(True)    # 连接后允许从飞控下载黑匣子
         self.poll_timer.start()               # 开始慢通道轮询
         self.fast_timer.start()               # 开始快通道轮询（姿态 10 帧/秒）
-        self.statusBar().showMessage("已连接")
+
+        # v0.8：兼容性评估 —— 非 BF 固件/未验证版本给出提示并锁定风险写入
+        self._compat = compatibility_report(info)
+        msgs = self._compat["messages"]
+        self.compat_label.setText("⚠ " + "\n⚠ ".join(msgs) if msgs else "")
+        self.compat_label.setVisible(bool(msgs))
+        feats = self._compat["features"]
+        if not feats.get("rates", True):
+            self.rates_write_btn.setEnabled(False)
+            self.rates_write_btn.setToolTip(
+                "该固件的 Rates 字节布局未适配，已锁定写入（只读）")
+        if not feats.get("filter", True):
+            self.filter_write_btn.setEnabled(False)
+            self.filter_write_btn.setToolTip(
+                "该固件的滤波器字节布局未适配，已锁定写入（只读）")
+        if not feats.get("presets", True):
+            self.preset_apply_btn.setEnabled(False)
+            self.preset_apply_btn.setToolTip(
+                "预设包含 Rates/滤波布局，该固件未适配，已锁定应用")
+        if msgs:
+            level_name = {"limited": "受限", "unknown": "未知"}.get(
+                self._compat["level"], self._compat["level"])
+            self.statusBar().showMessage(f"已连接（兼容模式：{level_name}）")
+        else:
+            self.statusBar().showMessage("已连接")
+
+    def _compat_allows(self, feature: str) -> bool:
+        """兼容性报告是否允许使用某功能（未评估时默认允许）"""
+        compat = getattr(self, "_compat", None)
+        if not compat:
+            return True
+        return compat["features"].get(feature, True)
 
     def on_pid_ready(self, names: list, values: list):
         """PID 数据到达：重建表格（连接、写入后、恢复后都会触发）"""
@@ -2793,6 +2877,8 @@ class MainWindow(QMainWindow):
             btn.setEnabled(False)
         self._rc_raw = None
         self._filter_raw = None
+        self._compat = None
+        self.compat_label.setVisible(False)
         self.bb_flash_btn.setEnabled(False)
         self.firmware_label.setText("未连接")
         self.board_label.setText("未连接")
@@ -2878,6 +2964,9 @@ def install_crash_logging():
 
 def main():
     install_crash_logging()
+    # 高 DPI 适配（v0.8）：分数缩放（125%/150%）下界面不模糊
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName("ApexFlight")
     if ICON_PATH.exists():

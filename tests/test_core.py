@@ -165,6 +165,99 @@ def test_preset_snapshot_roundtrip(tmp: Path = None):
     path.unlink()
 
 
+def test_parse_fc_version():
+    """固件版本字符串解析（v0.8）"""
+    assert m.parse_fc_version("Betaflight 4.5.2") == (4, 5, 2)
+    assert m.parse_fc_version("Betaflight 4.3") == (4, 3, 0)
+    assert m.parse_fc_version("未知") is None
+    assert m.parse_fc_version("") is None
+
+
+def test_compatibility_report():
+    """兼容性评估：固件变体 × 版本分级（v0.8）"""
+    # BF 4.5 → 完全支持
+    r = m.compatibility_report({"variant": "BTFL",
+                                "version_tuple": (4, 5, 2),
+                                "firmware": "Betaflight 4.5.2"})
+    assert r["level"] == "full" and not r["block_writes"] and not r["messages"]
+
+    # INAV → 受限 + 写入锁定
+    r = m.compatibility_report({"variant": "INAV",
+                                "version_tuple": (7, 1, 0),
+                                "firmware": "Betaflight 4.5.2（注意：检测到固件为 INAV）"})
+    assert r["level"] == "limited" and r["block_writes"]
+    assert not r["features"]["rates"] and not r["features"]["filter"]
+    assert r["features"]["pid"] and r["features"]["motors"]
+    assert any("INAV" in msg for msg in r["messages"])
+
+    # BF 4.3 → 受限但不锁写入
+    r = m.compatibility_report({"variant": "BTFL",
+                                "version_tuple": (4, 3, 0),
+                                "firmware": "Betaflight 4.3.0"})
+    assert r["level"] == "limited" and not r["block_writes"]
+
+    # BF 4.0 → 旧版本，只读保护
+    r = m.compatibility_report({"variant": "BTFL",
+                                "version_tuple": (4, 0, 0),
+                                "firmware": "Betaflight 4.0.0"})
+    assert r["level"] == "limited" and r["block_writes"]
+
+    # 版本未知 → unknown，不锁定
+    r = m.compatibility_report({"variant": "BTFL", "version_tuple": None,
+                                "firmware": "未知"})
+    assert r["level"] == "unknown" and not r["block_writes"]
+
+
+def test_partial_parsing():
+    """短数据容错解析（v0.8，老固件/非 BF 固件适配）"""
+    # 23 字节完整数据不标记 partial
+    full = m.parse_rc_tuning(bytes(range(23)))
+    assert "partial" not in full
+    # 14 字节短数据（老固件）：不抛异常、字段齐全、标记 partial
+    short = m.parse_rc_tuning(bytes(range(14)))
+    assert short["partial"] is True
+    assert short["rc_rate"] == [0.0, 0.12, 0.11]   # raw[0]、raw[12]、raw[11]
+    assert short["rate_limit"] == [1998, 1998, 1998]  # 超出长度 → 默认值
+    assert short["rates_type"] == 0                    # 超出长度 → 默认 0（经典）
+    # 滤波器 30 字节短数据
+    fshort = m.parse_filter_config(bytes(range(30)))
+    assert fshort["partial"] is True
+    assert "gyro_lpf1_hz" in fshort
+    # 过短（<8 字节）仍然报错
+    try:
+        m.parse_rc_tuning(b"\x01\x02")
+        assert False, "应当抛出 MspError"
+    except m.MspError:
+        pass
+
+
+def test_msp_retry_on_timeout():
+    """MSP 瞬态超时自动重试（v0.8）：第一次无响应、第二次正常"""
+    class FakeSerial:
+        """脚本化串口：第一次 write 后 read 永远返回空（模拟超时），
+        第二次 write 后才喂入一帧合法响应"""
+        def __init__(self):
+            self.writes = 0
+            self._buf = b""
+        def reset_input_buffer(self):
+            pass
+        def write(self, data):
+            self.writes += 1
+            if self.writes >= 2:
+                frame = bytes([3, 3, 4, 5, 2])   # len=3 cmd=3 版本 4.5.2
+                cks = 3 ^ 3 ^ 4 ^ 5 ^ 2
+                self._buf = b"$M>" + frame + bytes([cks])
+        def flush(self):
+            pass
+        def read(self, n):
+            out, self._buf = self._buf[:n], self._buf[n:]
+            return out
+    ser = FakeSerial()
+    data = m.msp_request(ser, 3, timeout=0.3, retries=1)
+    assert data == bytes([4, 5, 2])
+    assert ser.writes == 2                       # 确实重试了一次
+
+
 def test_classify_log_type():
     """飞行/地面空转日志判别"""
     n = 500
