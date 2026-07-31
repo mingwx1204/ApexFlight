@@ -72,10 +72,19 @@ def extract_json(text: str) -> dict:
 # ------------------------------------------------------------
 # v0.96：按电脑性能匹配最优本地调参模型
 # ------------------------------------------------------------
-def detect_hardware() -> dict:
-    """检测本机硬件（全标准库 + 可选 PowerShell / nvidia-smi，任何一步
-    失败都降级处理，绝不抛异常）：
-    {"cpu": 线程数, "ram_gb": 内存GB, "gpu": 显卡名, "vram_gb": 显存GB}"""
+_HW_CACHE: dict | None = None     # 检测结果缓存：重复点击秒回
+
+
+def detect_hardware(force: bool = False) -> dict:
+    """检测本机硬件（任何一步失败都降级处理，绝不抛异常）：
+    {"cpu": 线程数, "ram_gb": 内存GB, "gpu": 显卡名, "vram_gb": 显存GB}
+
+    v0.97 提速：显卡信息改走注册表直读（毫秒级，不再启动 PowerShell /
+    nvidia-smi，几秒变瞬间）；结果模块级缓存，再次点击立即返回。
+    """
+    global _HW_CACHE
+    if _HW_CACHE is not None and not force:
+        return dict(_HW_CACHE)
     import os
     hw = {"cpu": os.cpu_count() or 0, "ram_gb": 0.0,
           "gpu": "", "vram_gb": 0.0}
@@ -100,62 +109,67 @@ def detect_hardware() -> dict:
             hw["ram_gb"] = round(st.ullTotalPhys / (1024 ** 3), 1)
     except Exception:
         pass
-    # 显卡名：PowerShell WMI（独显优先），启动隐藏窗口。
-    # 有些环境 PATH 不含 System32，先 which 再找系统目录绝对路径
-    ps = None
+    # 显卡名 + 显存：注册表显示类设备直读（快）；qwMemorySize 是真实
+    # 显存字节数，NVIDIA/AMD/Intel 都填。按显存最大者为主显卡。
     try:
-        import shutil
-        ps = shutil.which("powershell")
-        if not ps:
-            import ctypes
-            buf = ctypes.create_unicode_buffer(260)
-            ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
-            cand = (buf.value + "\\WindowsPowerShell\\v1.0\\powershell.exe")
-            if os.path.exists(cand):
-                ps = cand
+        import winreg
+        base = (r"SYSTEM\CurrentControlSet\Control\Class"
+                r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        cards, i = [], 0
+        while True:
+            try:
+                sub = winreg.EnumKey(key, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                k = winreg.OpenKey(key, sub)
+                desc, _ = winreg.QueryValueEx(k, "DriverDesc")
+                vram = 0
+                try:
+                    vram, _ = winreg.QueryValueEx(
+                        k, "HardwareInformation.qwMemorySize")
+                except OSError:
+                    pass
+                if desc and "virtual" not in desc.lower():
+                    cards.append((desc, vram))
+            except OSError:
+                pass
+        if cards:
+            cards.sort(key=lambda c: c[1], reverse=True)   # 独显优先
+            hw["gpu"] = cards[0][0]
+            hw["vram_gb"] = round(cards[0][1] / (1024 ** 3), 1)
     except Exception:
         pass
-    if ps:
-        try:
-            import subprocess
-            out = subprocess.run(
-                [ps, "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_VideoController | "
-                 "Sort-Object -Descending AdapterRAM | "
-                 "Select-Object -First 1 -ExpandProperty Name)"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            hw["gpu"] = (out.stdout or "").strip().splitlines()[0] \
-                if out.stdout and out.stdout.strip() else ""
-        except Exception:
-            pass
-    # 显存：N 卡用 nvidia-smi 精确拿（WMI 的 AdapterRAM 对 >4GB 不可靠）。
-    # nvidia-smi 默认装在 NVSMI 目录，常不在 PATH
-    if "nvidia" in hw["gpu"].lower():
+    # 兜底：注册表没读到才用 PowerShell（兼容极端环境，平时走不到）
+    if not hw["gpu"]:
         try:
             import shutil
-            smi = shutil.which("nvidia-smi")
-            if not smi:
-                for cand in (
-                        os.path.join(
-                            os.environ.get("SystemRoot", r"C:\Windows"),
-                            "System32", "nvidia-smi.exe"),
-                        os.path.join(
-                            os.environ.get("ProgramFiles", r"C:\Program Files"),
-                            "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe")):
-                    if os.path.exists(cand):
-                        smi = cand
-                        break
-            if smi:
+            ps = shutil.which("powershell")
+            if not ps:
+                import ctypes
+                buf = ctypes.create_unicode_buffer(260)
+                ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
+                cand = (buf.value + "\\WindowsPowerShell\\v1.0"
+                        "\\powershell.exe")
+                if os.path.exists(cand):
+                    ps = cand
+            if ps:
                 import subprocess
                 out = subprocess.run(
-                    [smi, "--query-gpu=memory.total",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=8,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                hw["vram_gb"] = round(int(out.stdout.strip()) / 1024, 1)
+                    [ps, "-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_VideoController | "
+                     "Sort-Object -Descending AdapterRAM | "
+                     "Select-Object -First 1 -ExpandProperty Name)"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=getattr(subprocess,
+                                          "CREATE_NO_WINDOW", 0))
+                hw["gpu"] = (out.stdout or "").strip().splitlines()[0] \
+                    if out.stdout and out.stdout.strip() else ""
         except Exception:
             pass
+    _HW_CACHE = dict(hw)
     return hw
 
 

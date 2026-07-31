@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.96"
+APP_VERSION = "0.97"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -159,6 +159,9 @@ _EN = {
     "周围没有人员和杂物。": "people and objects away.",
     "只有两个安全确认都勾选且已连接，滑块才能用":
         "Sliders unlock only when both boxes are checked and connected",
+    "电机位置示意（编号与 BF 一致）": "Motor layout (numbering matches BF)",
+    "转动中的电机随油门高亮": "Spinning motors highlight with throttle",
+    "主控制": "Master", "停转电机": "Stop motors",
     # ---- 接收机页 ----
     "通道（未连接）": "Channels (not connected)",
     "实时显示接收机各通道数值（正常范围约 1000~2000，":

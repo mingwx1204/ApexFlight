@@ -38,7 +38,7 @@ try:
     from PyQt6.QtWidgets import (
         QAbstractButton, QApplication, QCheckBox, QComboBox, QDialog,
         QDoubleSpinBox,
-        QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+        QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
         QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
         QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
         QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QLineEdit,
@@ -1682,6 +1682,9 @@ class MainWindow(QMainWindow):
     # ---------- 页签 3：电机测试 ----------
 
     def _build_motor_tab(self) -> QWidget:
+        """电机测试页（v0.97 参照 BF 布局重做）：
+        左侧电机位置示意图（BF QUAD X 编号、转动高亮），
+        右侧竖滑块排（µs 实时读数）+ 主控制总滑块 + 停转电机"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
@@ -1691,35 +1694,59 @@ class MainWindow(QMainWindow):
         self._motor_timer.setSingleShot(True)
         self._motor_timer.setInterval(100)
         self._motor_timer.timeout.connect(self._send_motor_values)
+        self._motor_values = {}                   # 编号 -> 当前油门 0..1
 
-        # 安全警告区（红字）
+        # 顶部：红色警告 + 双重安全确认（左右排布，节省纵向空间）
+        top_warn = QHBoxLayout()
         warning = QLabel("⚠️ 危险：电机测试会让电机真实转动！\n"
                          "使用前必须【拆下所有螺旋桨】，并确认飞机固定牢固、"
                          "周围没有人员和杂物。")
         warning.setStyleSheet("color: #E04545; font-weight: bold;")
         warning.setWordWrap(True)
-        layout.addWidget(warning)
-
-        # 双重安全确认
+        top_warn.addWidget(warning, 1)
+        checks = QVBoxLayout()
         self.motor_check1 = QCheckBox("我已拆下所有螺旋桨")
         self.motor_check2 = QCheckBox("我了解风险，确认开始测试")
         self.motor_check1.stateChanged.connect(self._update_motor_lock)
         self.motor_check2.stateChanged.connect(self._update_motor_lock)
-        layout.addWidget(self.motor_check1)
-        layout.addWidget(self.motor_check2)
+        checks.addWidget(self.motor_check1)
+        checks.addWidget(self.motor_check2)
+        checks.addStretch()
+        top_warn.addLayout(checks)
+        layout.addLayout(top_warn)
 
-        # 电机滑块区域（连接后按实际通道数动态生成）
+        # 主体：左示意图 + 右滑块排
+        body = QHBoxLayout()
+
+        from apex_motor import MotorDiagramWidget
+        left_box = QGroupBox(tr("电机位置示意（编号与 BF 一致）"))
+        left_box.setMaximumWidth(340)
+        left_col = QVBoxLayout(left_box)
+        self.motor_diagram = MotorDiagramWidget()
+        left_col.addWidget(self.motor_diagram)
+        hint = QLabel(tr("转动中的电机随油门高亮"))
+        hint.setStyleSheet("color: #9AA0A6; font-size: 13px;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_col.addWidget(hint)
+        body.addWidget(left_box, 0)
+
+        # 右侧：滑块排（连接后按实际通道数动态生成，BF 风格竖滑块）
         self.motor_area = QGroupBox("电机输出（未连接）")
-        self.motor_layout = QGridLayout(self.motor_area)
-        layout.addWidget(self.motor_area)
+        self.motor_layout = QHBoxLayout(self.motor_area)
+        self.motor_layout.setSpacing(12)
+        body.addWidget(self.motor_area, 1)
+        layout.addLayout(body, 1)
 
-        # 全部停止按钮
-        self.motor_stop_btn = QPushButton("🛑 全部停止")
+        # 底部：停转电机（右对齐，BF 同款位置）
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        self.motor_stop_btn = QPushButton("🛑 " + tr("停转电机"))
         self.motor_stop_btn.setObjectName("dangerBtn")
         self.motor_stop_btn.setEnabled(False)
+        self.motor_stop_btn.setMinimumWidth(160)
         self.motor_stop_btn.clicked.connect(self.on_motor_stop)
-        layout.addWidget(self.motor_stop_btn)
-        layout.addStretch()
+        bottom.addWidget(self.motor_stop_btn)
+        layout.addLayout(bottom)
         return tab
 
     # ---------- 页签 4：接收机通道 ----------
@@ -4018,25 +4045,65 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "ApexFlight", message)
 
     def on_motor_count(self, count: int):
-        """根据电机通道数动态生成滑块"""
+        """根据电机通道数动态生成 BF 风格竖滑块排 + 主控制总滑块"""
         self._motor_count = count
         self.motor_area.setTitle(f"电机输出（{count} 个通道）")
-        # 清空旧滑块
+        self.motor_diagram.set_motor_count(count)
+        # 清空旧滑块（含子布局里的列）
         while self.motor_layout.count():
             item = self.motor_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
         self._motor_sliders = []
+        self._motor_values = {}
         for i in range(count):
-            label = QLabel(f"电机 {i + 1}: 0")
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(0, 1000)          # 0=停转，1000 对应输出 2000
+            col = QVBoxLayout()
+            val_label = QLabel("0")
+            val_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val_label.setStyleSheet("color: #3EC6E8; font-size: 15px;")
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(0, 1000)          # 0=停转，否则输出 1000+value µs
+            slider.setMinimumHeight(190)
             slider.setEnabled(False)
             slider.valueChanged.connect(
-                lambda v, idx=i, lab=label: self._on_motor_slider(idx, v, lab))
-            self.motor_layout.addWidget(label, i, 0)
-            self.motor_layout.addWidget(slider, i, 1)
-            self._motor_sliders.append((label, slider))
+                lambda v, idx=i, lab=val_label:
+                self._on_motor_slider(idx, v, lab))
+            num_label = QLabel(str(i + 1))
+            num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            num_label.setStyleSheet("font-weight: bold; font-size: 16px;")
+            col.addWidget(val_label)
+            col.addWidget(slider, 1, Qt.AlignmentFlag.AlignHCenter)
+            col.addWidget(num_label)
+            self.motor_layout.addLayout(col)
+            self._motor_sliders.append((val_label, slider))
+        # 分隔线 + 主控制（BF 同款：一个总滑块同时驱动全部电机）
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setStyleSheet("color: #3A3F47;")
+        self.motor_layout.addWidget(line)
+        mcol = QVBoxLayout()
+        self.motor_master_label = QLabel("0")
+        self.motor_master_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.motor_master_label.setStyleSheet(
+            "color: #F5A83D; font-size: 15px;")
+        self.motor_master = QSlider(Qt.Orientation.Vertical)
+        self.motor_master.setRange(0, 1000)
+        self.motor_master.setMinimumHeight(190)
+        self.motor_master.setEnabled(False)
+        self.motor_master.valueChanged.connect(self._on_master_slider)
+        mname = QLabel(tr("主控制"))
+        mname.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mname.setStyleSheet("font-weight: bold; font-size: 16px;")
+        mcol.addWidget(self.motor_master_label)
+        mcol.addWidget(self.motor_master, 1, Qt.AlignmentFlag.AlignHCenter)
+        mcol.addWidget(mname)
+        self.motor_layout.addLayout(mcol)
+        self.motor_layout.addStretch()
         self._update_motor_lock()
 
     def on_error(self, message: str):
@@ -4121,24 +4188,41 @@ class MainWindow(QMainWindow):
                     and self.worker.is_connected)
         for _, slider in self._motor_sliders:
             slider.setEnabled(unlocked)
+        if hasattr(self, "motor_master"):
+            self.motor_master.setEnabled(unlocked)
         self.motor_stop_btn.setEnabled(unlocked)
 
     def _on_motor_slider(self, index: int, value: int, label: QLabel):
-        """滑块变化：更新标签，重启去抖定时器（停手后才发送）"""
-        label.setText(f"电机 {index + 1}: {value}")
+        """滑块变化：µs 读数 + 示意图高亮 + 重启去抖定时器"""
+        label.setText("0" if value == 0 else str(1000 + value))
+        self._motor_values[index + 1] = value / 1000.0
+        self.motor_diagram.set_values(self._motor_values)
         self._motor_timer.start()
 
+    def _on_master_slider(self, value: int):
+        """主控制：把所有电机滑块拉到同一值（各滑块自己去抖发送）"""
+        self.motor_master_label.setText("0" if value == 0
+                                        else str(1000 + value))
+        for _, slider in self._motor_sliders:
+            slider.setValue(value)      # 触发各自 _on_motor_slider
+
     def _send_motor_values(self):
-        """去抖定时器触发：把当前全部滑块值发给飞控"""
-        values = [s.value() for _, s in self._motor_sliders]
+        """去抖定时器触发：把当前全部滑块值发给飞控。
+        滑块 0 = 停转（发 0），其余按 BF 惯例映射为 1000+value（µs）。"""
+        values = []
+        for _, s in self._motor_sliders:
+            v = s.value()
+            values.append(0 if v == 0 else 1000 + v)
         # 补齐到 8 个通道（协议固定 8 个电机）
         values += [0] * (8 - len(values))
         self._run_in_thread(self.worker.set_motor_values, values[:8])
 
     def on_motor_stop(self):
-        """全部停止：所有滑块归零"""
+        """停转电机：所有滑块（含主控制）归零"""
         for _, slider in self._motor_sliders:
             slider.setValue(0)
+        if hasattr(self, "motor_master"):
+            self.motor_master.setValue(0)
 
     def _stop_motors_safely(self):
         """断开/关闭前尝试把所有电机停掉"""
