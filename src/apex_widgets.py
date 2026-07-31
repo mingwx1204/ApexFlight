@@ -57,8 +57,11 @@ class AttitudeIndicator(QWidget):
         self.setMinimumSize(180, 180)
 
     def set_attitude(self, roll: float, pitch: float):
-        """更新姿态角（单位：度）并重绘"""
-        self._roll, self._pitch = roll, pitch
+        """更新姿态角（单位：度）并重绘。
+        v0.91：平滑插值——显示值向目标值渐进收敛，
+        快速转动时仪表不再生硬跳变，观感更顺滑。"""
+        self._roll += (roll - self._roll) * 0.45
+        self._pitch += (pitch - self._pitch) * 0.45
         self.update()
 
     def paintEvent(self, event):

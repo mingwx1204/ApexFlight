@@ -55,19 +55,35 @@ except ImportError as _dep_err:
         pass
     raise SystemExit(1)
 
-# matplotlib 用于黑匣子曲线绘制（嵌入式画布）；未安装时黑匣子页给出提示
-try:
-    import matplotlib
-    matplotlib.use("QtAgg")
-    # 中文显示配置（微软雅黑），并修复负号显示
-    matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
-    matplotlib.rcParams["axes.unicode_minus"] = False
-    from matplotlib.backends.backend_qtagg import (
-        FigureCanvasQTAgg, NavigationToolbar2QT)
-    from matplotlib.figure import Figure
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
+# matplotlib 用于黑匣子曲线绘制（嵌入式画布）。
+# v0.91：改为延迟加载——模块导入时不再阻塞，main() 在启动画面显示后
+# 再调用 load_matplotlib()，启动更快、有进度反馈；未安装时黑匣子页给出提示。
+HAS_MPL = False
+Figure = None
+FigureCanvasQTAgg = None
+NavigationToolbar2QT = None
+
+
+def load_matplotlib() -> bool:
+    """加载 matplotlib（幂等）。返回是否可用。"""
+    global HAS_MPL, Figure, FigureCanvasQTAgg, NavigationToolbar2QT
+    if HAS_MPL or Figure is not None:
+        return HAS_MPL
+    try:
+        import matplotlib
+        matplotlib.use("QtAgg")
+        # 中文显示配置（微软雅黑），并修复负号显示
+        matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg as _Canvas, NavigationToolbar2QT as _Toolbar)
+        from matplotlib.figure import Figure as _Figure
+        Figure, FigureCanvasQTAgg, NavigationToolbar2QT = (
+            _Figure, _Canvas, _Toolbar)
+        HAS_MPL = True
+    except ImportError:
+        HAS_MPL = False
+    return HAS_MPL
 
 # 同目录下的功能模块（src/ 已在 sys.path 中，直接 import）
 from apex_msp import *       # noqa: F401,F403  MSP 协议
@@ -546,7 +562,8 @@ class MainWindow(QMainWindow):
         i18n.init_from_config(self._cfg)
 
         self.setWindowTitle(f"{i18n.APP_NAME} v{i18n.APP_VERSION}")
-        self.resize(960, 680)
+        self.resize(1280, 800)                # v0.91：默认更大工作区
+        self.setMinimumSize(1080, 680)
         self._center_on_screen()
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -834,7 +851,7 @@ class MainWindow(QMainWindow):
 
         self.sidebar = QListWidget()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(150)
+        self.sidebar.setFixedWidth(168)       # v0.91：加宽，长页面名不挤压
         self.sidebar.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # 隐藏横向滚动条
         # 侧栏条目 = 图标 + 名称键（名称键用于 i18n 翻译）
@@ -866,14 +883,32 @@ class MainWindow(QMainWindow):
         body_widget.setLayout(body)
         layout.addWidget(body_widget, 1)
 
-        # 导航点击切换页面
-        self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
+        # 导航点击切换页面（带淡入动画）
+        self.sidebar.currentRowChanged.connect(self._on_page_changed)
 
         # 应用日志总线 → 日志页
         app_logger.appended.connect(self._on_app_log)
         log_event(f"ApexFlight v{i18n.APP_VERSION} 已启动")
 
         self.statusBar().showMessage(tr("就绪：请选择串口后点击「连接」"))
+
+    def _on_page_changed(self, index: int):
+        """切换页面：先切索引，再给新页面加 180ms 淡入动画（v0.91）。
+        动画结束后移除透明效果，避免影响后续重绘性能。"""
+        from PyQt6.QtCore import QAbstractAnimation, QPropertyAnimation
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        self.pages.setCurrentIndex(index)
+        page = self.pages.currentWidget()
+        if page is None:
+            return
+        effect = QGraphicsOpacityEffect(page)
+        page.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(180)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.finished.connect(lambda: page.setGraphicsEffect(None))
+        anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     # ---------- 页签 10：应用日志（参考 BF Configurator 日志页） ----------
 
@@ -1300,7 +1335,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.bb_file_label, 1)
         layout.addLayout(top)
 
-        if not HAS_MPL:
+        if not load_matplotlib():
             warn = QLabel("⚠️ 未安装 matplotlib，无法绘图。\n"
                           "请在终端运行：pip install matplotlib")
             warn.setStyleSheet("color: #E04545; font-weight: bold;")
@@ -2008,7 +2043,7 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout()
         curve_box = QGroupBox("Rates 预览")
         curve_layout = QVBoxLayout(curve_box)
-        if HAS_MPL:
+        if load_matplotlib():
             self.rates_figure = Figure(figsize=(5, 6), facecolor="#1B1E23")
             self.rates_canvas = FigureCanvasQTAgg(self.rates_figure)
             curve_layout.addWidget(self.rates_canvas)
@@ -3242,8 +3277,39 @@ def main():
     app.setApplicationName("ApexFlight")
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
+
+    # 启动画面（v0.91）：exe 启动后立刻给出反馈，分步显示加载进度。
+    # 图标绘在深色底上，底部留文字区显示当前加载步骤。
+    from PyQt6.QtWidgets import QSplashScreen
+    pix = QPixmap(380, 300)
+    pix.fill(QColor("#16181D"))
+    painter = QPainter(pix)
+    if ICON_PATH.exists():
+        icon = QPixmap(str(ICON_PATH)).scaled(
+            150, 150, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        painter.drawPixmap((380 - icon.width()) // 2, 30, icon)
+    painter.setPen(QColor("#3EC6E8"))
+    painter.drawText(pix.rect().adjusted(0, 190, 0, -60),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                     "ApexFlight")
+    painter.end()
+
+    def splash_msg(text: str):
+        splash.showMessage(
+            f"v{i18n.APP_VERSION}    {text}",
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+            QColor("#9AA0A6"))
+        app.processEvents()
+
+    splash = QSplashScreen(pix)
+    splash.show()
+    splash_msg("正在加载图表组件……")
+    load_matplotlib()                         # 延迟加载 matplotlib
+    splash_msg("正在构建界面……")
     window = MainWindow()
     window.show()
+    splash.finish(window)
     sys.exit(app.exec())
 
 

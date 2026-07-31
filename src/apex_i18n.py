@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.9"
+APP_VERSION = "0.91"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
