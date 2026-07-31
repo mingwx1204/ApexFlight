@@ -150,13 +150,36 @@ def download_blob(name: str, digest: str, size: int, dest: Path,
     sidecar.unlink(missing_ok=True)
 
     expect = digest.split(":", 1)[1]
-    h = hashlib.sha256()
-    with open(dest, "rb") as f:
-        for blk in iter(lambda: f.read(4 * 1024 * 1024), b""):
-            h.update(blk)
-    if h.hexdigest() != expect:
+    if _sha256_of(dest) != expect:
         dest.unlink(missing_ok=True)
         raise PullError(f"SHA256 校验失败：{digest[:19]}…（已删除坏文件）")
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _try_reuse_official_partial(blob_dir: Path, digest: str, size: int,
+                                final: Path, on_progress=None) -> bool:
+    """官方 `ollama pull` 的 -partial 文件若已下满且校验通过，直接转正入库，
+    避免用户之前白等了几十分钟的下载被浪费（v1.00）"""
+    base = "sha256-" + digest.split(":", 1)[1]
+    partial = blob_dir / (base + "-partial")
+    if not (partial.exists() and partial.stat().st_size == size):
+        return False
+    if on_progress:
+        on_progress("检测到官方下载残留的完整分片，校验后直接入库…")
+    if _sha256_of(partial) != digest.split(":", 1)[1]:
+        return False                                # 内容坏：不用，重下
+    final.parent.mkdir(parents=True, exist_ok=True)
+    if final.exists():
+        final.unlink()
+    os.replace(partial, final)
+    return True
 
 
 def pull_model_multithread(model: str, segments: int = 16,
@@ -176,13 +199,19 @@ def pull_model_multithread(model: str, segments: int = 16,
         manifest = json.loads(manifest_raw)
         items = [manifest["config"], *manifest.get("layers", [])]
 
-        # 计划：已在库中且尺寸吻合的 blob 直接跳过（幂等）
+        # 计划：已在库中且尺寸吻合的 blob 直接跳过（幂等）；
+        # 官方 pull 残留的完整 -partial 校验后转正（v1.00）
         plan = []
         for it in items:
             digest, size = it["digest"], int(it["size"])
             final = blob_dir / ("sha256-" + digest.split(":", 1)[1])
             if final.exists() and final.stat().st_size == size:
                 continue
+            if _try_reuse_official_partial(blob_dir, digest, size, final,
+                                           on_progress):
+                continue
+            if final.exists() and final.stat().st_size == size:
+                continue  # 竞态兜底：校验期间 ollama 服务自己完成了入库
             plan.append((digest, size, final))
 
         prog = PullProgress(sum(s for _, s, _ in plan), segments)
