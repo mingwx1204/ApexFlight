@@ -3035,14 +3035,19 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
 
         def work():
             try:
+                import re
                 import subprocess
+                # ollama 进度条带 ANSI 控制符（\x1b[K 清行、\x1b[?25h 光标等），
+                # Qt 状态栏不认会显示成乱码方块，转发前先剥掉
+                ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
                 proc = subprocess.Popen(
                     ["ollama", "pull", model],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="ignore",
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 for line in proc.stdout or []:
-                    line = line.strip()
+                    # \r 原地刷新的进度在 text 模式下已拆成多行
+                    line = ansi.sub("", line).replace("\x1b", "").strip()
                     if line:
                         self._pull_progress = line   # 状态栏轮询读取
                 return proc.wait()
