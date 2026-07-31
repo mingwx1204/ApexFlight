@@ -1101,6 +1101,84 @@ def generate_demo_log() -> Path:
     return path
 
 
+def analyze_blackbox_stats(time_axis: list, data: dict, columns: list) -> dict:
+    """
+    黑匣子结构化分析（v0.6）：把日志算成一组有调参意义的指标，
+    供「AI 调参建议」和「AI 解读图表」使用。
+    返回指标字典：时长/采样率、各轴陀螺仪 RMS 噪声与 FFT 主峰、
+    设定值→陀螺仪跟踪滞后（互相关）、电机饱和占比、最低电压。
+    """
+    import numpy as np
+
+    stats = {}
+    if not time_axis:
+        return stats
+    stats["时长(秒)"] = round(time_axis[-1], 1)
+    t = np.array(time_axis)
+    dt = float(np.median(np.diff(t))) if len(t) > 1 else 0
+    stats["采样率(Hz)"] = round(1 / dt) if dt > 0 else 0
+
+    def arr(name):
+        return np.array(data.get(name, []), dtype=float)
+
+    axis_names = {0: "横滚", 1: "俯仰", 2: "偏航"}
+    # ---- 各轴陀螺仪：RMS 噪声 + 前 3 个频谱峰 ----
+    for axis in range(3):
+        name = f"gyroADC[{axis}]"
+        if name not in data or dt <= 0:
+            continue
+        y = arr(name)
+        y = y[~np.isnan(y)]
+        if len(y) < 64:
+            continue
+        y = y - y.mean()
+        rms = float(np.sqrt(np.mean(y * y)))
+        windowed = y * np.hanning(len(y))
+        spec = np.abs(np.fft.rfft(windowed)) / len(y) * 2
+        freqs = np.fft.rfftfreq(len(y), dt)
+        mask = freqs > 20                       # 忽略机身运动频率
+        peaks = []
+        if mask.any():
+            vf, vs = freqs[mask], spec[mask]
+            top = np.argsort(vs)[-3:]
+            peaks = sorted(round(float(vf[i])) for i in top)
+        stats[f"陀螺仪·{axis_names[axis]} RMS噪声(°/s)"] = round(rms, 1)
+        stats[f"陀螺仪·{axis_names[axis]} 噪声峰(Hz)"] = peaks
+
+    # ---- 跟踪质量：setpoint → gyro 的互相关滞后（正 = 陀螺仪慢）----
+    for axis in range(3):
+        sp, gy = f"setpoint[{axis}]", f"gyroADC[{axis}]"
+        if sp not in data or gy not in data or dt <= 0:
+            continue
+        s, g = arr(sp), arr(gy)
+        n = min(len(s), len(g))
+        s = np.nan_to_num(s[:n] - np.nanmean(s[:n]))
+        g = np.nan_to_num(g[:n] - np.nanmean(g[:n]))
+        if np.std(s) < 1e-6 or np.std(g) < 1e-6:
+            continue
+        corr = np.correlate(g, s, mode="full")
+        lag = int(np.argmax(corr) - (n - 1))
+        stats[f"跟踪滞后·{axis_names[axis]}(ms)"] = round(lag * dt * 1000, 1)
+
+    # ---- 电机饱和（输出 >1950 的时间占比，取最高的一只电机）----
+    motors = [c for c in columns if c.startswith("motor[")]
+    sat = []
+    for mn in motors:
+        mv = arr(mn)
+        mv = mv[~np.isnan(mv)]
+        if len(mv):
+            sat.append(float(np.mean(mv > 1950) * 100))
+    if sat:
+        stats["电机饱和时间占比(%)"] = round(max(sat), 1)
+
+    # ---- 电压（vbatLatest 单位 0.01V）----
+    if "vbatLatest" in data:
+        v = arr("vbatLatest") / 100.0
+        v = v[~np.isnan(v)]
+        if len(v):
+            stats["最低电压(V)"] = round(float(v.min()), 2)
+    return stats
+
 # ============================================================
 # 第五部分：后台工作线程（防止界面卡死）
 # ============================================================
@@ -1500,12 +1578,14 @@ class SerialWorker(QObject):
 # 通过 pyqtSignal 把流式生成的文字安全地送回界面线程。
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-AI_RECOMMENDED_MODELS = ["qwen2.5:1.5b", "qwen2.5:3b"]   # RTX 2060 6GB 适用
+AI_RECOMMENDED_MODELS = ["qwen2.5:3b", "qwen2.5:1.5b"]   # v0.6 主推 3b 深度分析
 
 AI_SYSTEM_PROMPT = (
     "你是 ApexFlight 内置的无人机调参专家助手，精通 Betaflight 固件、"
-    "PID 调参、滤波设置和黑匣子日志分析。"
+    "PID 调参、Rates/滤波设置和黑匣子日志分析。"
     "请始终使用简体中文回答，语言简洁、给出可操作建议。"
+    "分析数据时请按这个结构回答：①总体状态判断 ②按优先级排列的具体修改建议"
+    "（改哪项、建议改成多少、依据是什么）③需要提醒的风险。"
     "涉及电机测试、参数修改等操作时，务必先提醒用户卸下螺旋桨、注意人身安全。"
 )
 
@@ -1700,8 +1780,8 @@ class MainWindow(QMainWindow):
         self._ai_reply_buffer = ""            # 当前这一轮回答的累积文字
         self._ai_busy = False                 # AI 是否正在回答
         self._threads = []                    # 持有线程引用，防止被回收
-        self._polling = False                 # 慢通道轮询线程是否正在跑
-        self._polling_fast = False            # 快通道轮询线程是否正在跑
+        self._poll_thread = None              # 慢通道轮询线程（竞态防护）
+        self._poll_fast_thread = None         # 快通道轮询线程
         self._pid_names = []                  # 当前 PID 名称列表
         self._motor_sliders = []              # 电机滑块列表
         self._motor_count = 0
@@ -2118,6 +2198,13 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # 滑块去抖定时器：拖动停止 100ms 后才真正发送 MSP_SET_MOTOR，
+        # 避免快速拖动时每动一格就起一个后台线程、几十个线程抢串口锁
+        self._motor_timer = QTimer(self)
+        self._motor_timer.setSingleShot(True)
+        self._motor_timer.setInterval(100)
+        self._motor_timer.timeout.connect(self._send_motor_values)
+
         # 安全警告区（红字）
         warning = QLabel("⚠️ 危险：电机测试会让电机真实转动！\n"
                          "使用前必须【拆下所有螺旋桨】，并确认飞机固定牢固、"
@@ -2286,6 +2373,14 @@ class MainWindow(QMainWindow):
         self.bb_fft_btn.clicked.connect(self.on_bb_fft)
         self.bb_fft_btn.setEnabled(False)
         left.addWidget(self.bb_fft_btn)
+
+        self.bb_ai_btn = QPushButton("🤖 AI 解读图表")
+        self.bb_ai_btn.setToolTip(
+            "把这段日志的结构化分析（噪声峰/跟踪滞后/电机饱和等）"
+            "发给 AI 解读并给出调参方向")
+        self.bb_ai_btn.clicked.connect(self.on_bb_ask_ai)
+        self.bb_ai_btn.setEnabled(False)
+        left.addWidget(self.bb_ai_btn)
 
         # 游标读数
         self.bb_cursor_label = QLabel("移动鼠标到图上查看数值")
@@ -2484,6 +2579,7 @@ class MainWindow(QMainWindow):
             self.bb_toggles[col].setChecked(True)
         self.bb_plot_btn.setEnabled(True)
         self.bb_fft_btn.setEnabled(True)
+        self.bb_ai_btn.setEnabled(True)
         self.statusBar().showMessage("日志加载完成，点击「绘制曲线」")
         self.on_bb_plot()
 
@@ -2614,6 +2710,28 @@ class MainWindow(QMainWindow):
             parts.append(f"{display}: {values[min(i, len(values)-1)]:.1f}")
         self.bb_cursor_label.setText("\n".join(parts))
         self.bb_canvas.draw_idle()
+
+    def on_bb_ask_ai(self):
+        """把当前日志的结构化分析发给 AI 解读，自动切到 AI 页看回答"""
+        if not self.bb_time:
+            self.statusBar().showMessage("请先加载日志文件")
+            return
+        stats = analyze_blackbox_stats(
+            self.bb_time, self.bb_data, self.bb_columns)
+        if not stats:
+            self.statusBar().showMessage("日志数据不足以分析")
+            return
+        selected = [CHANNEL_NAMES.get(c, c)
+                    for c in self._bb_selected_channels()]
+        prompt = (
+            "请解读这段穿越机黑匣子日志的结构化分析结果，"
+            "指出飞机的状态问题并给出调参方向"
+            "（噪声峰→滤波器设置，跟踪滞后→PID/FeedForward，"
+            "电机饱和→机架/重心，掉压→电池）：\n"
+            f"我正在查看的通道：{'、'.join(selected) if selected else '（未选择）'}\n"
+            + "\n".join(f"{k}：{v}" for k, v in stats.items()))
+        self.sidebar.setCurrentRow(8)         # 切到 AI 助手页
+        self._ai_ask(prompt)
 
     # ---------- 黑匣子：频谱分析（FFT）----------
 
@@ -2817,7 +2935,13 @@ class MainWindow(QMainWindow):
             self.thr_limit_spin.setValue(parsed["thr_limit_pct"])
             self.thr_limit_spin.blockSignals(False)
             self._draw_rates_curve()
-            self.rates_write_btn.setEnabled(True)
+            # 安全保护：固件使用 Actual/Quick/Raceflight 等非经典 Rates 类型时，
+            # 数值含义不同，从此页写入可能破坏手感配置 → 禁止写入，只允许看
+            classic = parsed.get("rates_type", 0) == 0
+            self.rates_write_btn.setEnabled(classic)
+            self.rates_write_btn.setToolTip(
+                "" if classic else
+                "固件使用非经典 Rates 类型，为安全起见禁止从此页写入")
         except (MspError, KeyError, TypeError):
             self._rc_raw = None
             self.rates_write_btn.setEnabled(False)
@@ -3265,6 +3389,12 @@ class MainWindow(QMainWindow):
 
         # ---- 快捷分析按钮 ----
         quick = QHBoxLayout()
+        self.ai_advice_btn = QPushButton("🧠 综合调参建议")
+        self.ai_advice_btn.setToolTip(
+            "把飞控全部数据（PID + Rates + 滤波器 + 黑匣子分析）"
+            "一次性发给 AI，生成按优先级排列的调参方案")
+        self.ai_advice_btn.clicked.connect(self.on_ai_tuning_advice)
+        quick.addWidget(self.ai_advice_btn)
         self.ai_pid_btn = QPushButton("🎛️ 分析当前 PID")
         self.ai_pid_btn.setToolTip("把当前读取到的 PID 参数发给 AI 分析")
         self.ai_pid_btn.clicked.connect(self.on_ai_analyze_pid)
@@ -3395,6 +3525,67 @@ class MainWindow(QMainWindow):
             "这是我的穿越机黑匣子日志的统计/频谱分析结果，"
             "请解读这些数据反映了什么飞行状态或噪声问题，"
             "并给出滤波或 PID 调整建议：\n" + stats)
+        self._ai_ask(prompt)
+
+    # ---------- v0.6：AI 综合调参建议（全量数据深度联动） ----------
+
+    def _collect_tuning_context(self) -> str:
+        """汇总飞控全部调参数据 + 黑匣子结构化分析，生成给 AI 的文本"""
+        parts = []
+        info = self.worker.fc_info or {}
+        if info:
+            parts.append(
+                f"【飞控】固件 {info.get('firmware', '?')}，"
+                f"板子 {info.get('board', '?')}，{info.get('motors', '?')}")
+        if self._pid_names:
+            lines = []
+            for row, name in enumerate(self._pid_names):
+                vals = []
+                for col in range(3):
+                    item = self.pid_table.item(row, col)
+                    vals.append(item.text() if item else "?")
+                lines.append(f"{name}: P={vals[0]} I={vals[1]} D={vals[2]}")
+            parts.append("【PID】\n" + "\n".join(lines))
+        if self._rc_raw is not None:
+            p = parse_rc_tuning(bytes(self._rc_raw))
+            parts.append(
+                "【Rates】RC Rate R/P/Y = "
+                + "/".join(f"{v:.2f}" for v in p["rc_rate"])
+                + "，Rate = " + "/".join(f"{v:.2f}" for v in p["rate"])
+                + "，Expo = " + "/".join(f"{v:.2f}" for v in p["expo"])
+                + f"，油门中点 {p['thr_mid']:.2f}，"
+                  f"油门 Expo {p['thr_expo']:.2f}")
+        if self._filter_raw is not None:
+            f = parse_filter_config(bytes(self._filter_raw))
+            parts.append(
+                f"【滤波】陀螺仪低通 动态 {f['gyro_dyn_min']}-"
+                f"{f['gyro_dyn_max']}Hz（静态 {f['gyro_lpf1_hz']}/"
+                f"{f['gyro_lpf2_hz']}Hz），D项低通 动态 {f['dterm_dyn_min']}-"
+                f"{f['dterm_dyn_max']}Hz（静态 {f['dterm_lpf1_hz']}/"
+                f"{f['dterm_lpf2_hz']}Hz），动态陷波 {f['notch_count']} 个 "
+                f"{f['notch_min']}-{f['notch_max']}Hz Q={f['notch_q']}，"
+                f"RPM 滤波 谐波 {f['rpm_harmonics']} 最低 "
+                f"{f['rpm_min_hz']}Hz")
+        if self.bb_time:
+            stats = analyze_blackbox_stats(
+                self.bb_time, self.bb_data, self.bb_columns)
+            if stats:
+                parts.append("【黑匣子分析】\n" + "\n".join(
+                    f"{k}：{v}" for k, v in stats.items()))
+        return "\n\n".join(parts)
+
+    def on_ai_tuning_advice(self):
+        """综合调参建议：全部真实数据一次性发给 AI 出方案"""
+        context = self._collect_tuning_context()
+        if not context:
+            self.statusBar().showMessage(
+                "还没有数据：请先连接飞控（最好再加载一段黑匣子日志）")
+            return
+        prompt = (
+            "请基于下面这台穿越机的全部真实数据给出调参建议。"
+            "注意：滤波器截止频率 0 表示该滤波器已关闭；"
+            "电机饱和时间占比高说明机架/重心/PID 可能有问题；"
+            "跟踪滞后大可以考虑加 FeedForward 或 P。\n\n" + context)
         self._ai_ask(prompt)
 
     def _ai_ask(self, user_text: str):
@@ -3532,28 +3723,27 @@ class MainWindow(QMainWindow):
     # ---------- 实时轮询 ----------
 
     def _poll_once(self):
-        """慢通道定时器触发：读电压/CPU/解锁标志（避免重复启动）"""
-        if self._polling or not self.worker.is_connected:
+        """慢通道定时器触发：上一轮没跑完就跳过。
+        用线程存活判断代替布尔标志——布尔标志的读写跨线程无锁，
+        定时器和后台线程可能同时看到 False 而重复启动轮询（竞态）。"""
+        if not self.worker.is_connected:
             return
-        self._polling = True
-        def run():
-            try:
-                self.worker.poll_status()
-            finally:
-                self._polling = False
-        self._run_in_thread(run)
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._poll_thread = threading.Thread(
+            target=self.worker.poll_status, daemon=True)
+        self._poll_thread.start()
 
     def _poll_fast_once(self):
-        """快通道定时器触发：读姿态角和 RC 通道（避免重复启动）"""
-        if self._polling_fast or not self.worker.is_connected:
+        """快通道定时器触发：同理，上一轮没跑完就跳过"""
+        if not self.worker.is_connected:
             return
-        self._polling_fast = True
-        def run():
-            try:
-                self.worker.poll_fast()
-            finally:
-                self._polling_fast = False
-        self._run_in_thread(run)
+        if self._poll_fast_thread is not None \
+                and self._poll_fast_thread.is_alive():
+            return
+        self._poll_fast_thread = threading.Thread(
+            target=self.worker.poll_fast, daemon=True)
+        self._poll_fast_thread.start()
 
     # ---------- 信号槽 ----------
 
@@ -3593,7 +3783,6 @@ class MainWindow(QMainWindow):
 
     def on_status_ready(self, data: dict):
         """慢通道数据到达：更新电源和飞控状态区域"""
-        self._polling = False
         self.voltage_label.setText(f"{data.get('voltage', 0):.2f} V")
         self.amps_label.setText(f"{data.get('amps', 0):.2f} A")
         self.mah_label.setText(f"{data.get('mah', 0)} mAh")
@@ -3607,7 +3796,6 @@ class MainWindow(QMainWindow):
 
     def on_fast_ready(self, data: dict):
         """快通道数据到达：更新人工地平线和接收机通道"""
-        self._polling_fast = False
         attitude = data.get("attitude")
         if attitude:
             roll, pitch, yaw = attitude
@@ -3646,8 +3834,6 @@ class MainWindow(QMainWindow):
         self._update_motor_lock()
 
     def on_error(self, message: str):
-        self._polling = False
-        self._polling_fast = False
         # 闪存下载失败/被取消时：恢复按钮文字和轮询定时器
         if self._flash_cancel is not None:
             self._flash_cancel = None
@@ -3731,8 +3917,12 @@ class MainWindow(QMainWindow):
         self.motor_stop_btn.setEnabled(unlocked)
 
     def _on_motor_slider(self, index: int, value: int, label: QLabel):
-        """滑块变化：更新标签并发送全部电机值"""
+        """滑块变化：更新标签，重启去抖定时器（停手后才发送）"""
         label.setText(f"电机 {index + 1}: {value}")
+        self._motor_timer.start()
+
+    def _send_motor_values(self):
+        """去抖定时器触发：把当前全部滑块值发给飞控"""
         values = [s.value() for _, s in self._motor_sliders]
         # 补齐到 8 个通道（协议固定 8 个电机）
         values += [0] * (8 - len(values))
