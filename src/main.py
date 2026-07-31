@@ -483,12 +483,32 @@ def set_rc_value(raw: bytearray, field: str, axis: int, value: float):
 def bf_rate_curve(stick: float, rc_rate: float, super_rate: float,
                   expo: float) -> float:
     """
-    Betaflight 经典 Rates 公式：摇杆偏转 0~1 → 角速度（°/s）。
-    中位附近由 rc_rate/expo 决定，满杆由 super_rate 拉升。
+    Betaflight 经典 Rates 公式（与固件 fc/rc.c applyBetaflightRates 一致）：
+    摇杆偏转 0~1 → 角速度（°/s）。
+    注意：expo 只弯曲线性部分；满杆拉升系数用的是 expo 之前的原始杆量；
+    rc_rate 超过 2.0 时固件还有额外的线性增益（14.54 倍斜率）。
     """
     xe = stick * (1 - expo) + stick ** 3 * expo
-    denom = max(0.01, 1 - super_rate * abs(xe))
-    return 200 * rc_rate * xe / denom
+    if rc_rate > 2.0:
+        rc_rate += 14.54 * (rc_rate - 2.0)
+    angle = 200 * rc_rate * xe
+    if super_rate:
+        angle /= max(0.01, 1 - abs(stick) * super_rate)
+    return angle
+
+
+def bf_throttle_curve(x: float, mid: float, expo: float) -> float:
+    """
+    Betaflight 油门曲线（与固件 fc/rc.c lookupThrottleRC 一致）：
+    输入油门 0~1 → 输出 0~1，曲线锚定中点 (mid, mid)，expo 控制弯曲程度。
+    """
+    if mid <= 0 or mid >= 1:
+        mid = 0.5
+    scale = (1 - mid) if x > mid else mid
+    if scale <= 0:
+        return mid
+    t = (x - mid) / scale
+    return mid + t * (1 - expo + expo * t * t) * scale
 
 
 # ------------------------------------------------------------
@@ -503,6 +523,12 @@ FILTER_FIELDS = [
     ("dterm_lpf1_hz", "D 项低通 1 截止频率 (Hz)",   1,  "u16", 0, 500),
     ("dterm_lpf2_hz", "D 项低通 2 截止频率 (Hz)",   26, "u16", 0, 500),
     ("yaw_lpf_hz",    "偏航低通截止频率 (Hz)",       3,  "u16", 0, 500),
+    ("gyro_notch1_hz",     "陀螺仪陷波 1 频率 (Hz)",  5,  "u16", 0, 1000),
+    ("gyro_notch1_cutoff", "陀螺仪陷波 1 截止 (Hz)",  7,  "u16", 0, 1000),
+    ("dterm_notch_hz",     "D 项陷波频率 (Hz)",       9,  "u16", 0, 500),
+    ("dterm_notch_cutoff", "D 项陷波截止 (Hz)",       11, "u16", 0, 500),
+    ("gyro_notch2_hz",     "陀螺仪陷波 2 频率 (Hz)",  13, "u16", 0, 1000),
+    ("gyro_notch2_cutoff", "陀螺仪陷波 2 截止 (Hz)",  15, "u16", 0, 1000),
     ("gyro_dyn_min",  "陀螺仪动态低通·下限 (Hz)",   29, "u16", 0, 1000),
     ("gyro_dyn_max",  "陀螺仪动态低通·上限 (Hz)",   31, "u16", 0, 1000),
     ("dterm_dyn_min", "D 项动态低通·下限 (Hz)",     33, "u16", 0, 500),
@@ -515,6 +541,13 @@ FILTER_FIELDS = [
     ("rpm_harmonics", "RPM 滤波·谐波数量",          43, "u8",  0, 3),
     ("rpm_min_hz",    "RPM 滤波·最低频率 (Hz)",     44, "u8",  0, 255),
 ]
+
+# 滤波器类型字段（下拉选择）：键名 → 字节偏移
+FILTER_TYPE_FIELDS = {
+    "gyro_lpf1_type": 24, "gyro_lpf2_type": 25,
+    "dterm_lpf1_type": 17, "dterm_lpf2_type": 28,
+}
+FILTER_TYPES = ["PT1", "Biquad", "PT2", "PT3"]
 
 
 def query_filter_config(ser: serial.Serial) -> bytes:
@@ -2055,12 +2088,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.pid_table)
 
         buttons = QHBoxLayout()
-        self.pid_reload_btn = QPushButton("重新读取")
+        buttons.addStretch()
+        self.pid_reload_btn = QPushButton("刷新")
         self.pid_reload_btn.clicked.connect(self.on_pid_reload)
         self.pid_reload_btn.setEnabled(False)
         buttons.addWidget(self.pid_reload_btn)
 
-        self.pid_write_btn = QPushButton("写入飞控")
+        self.pid_write_btn = QPushButton("保存")
+        self.pid_write_btn.setObjectName("connectBtn")
         self.pid_write_btn.clicked.connect(self.on_pid_write)
         self.pid_write_btn.setEnabled(False)
         buttons.addWidget(self.pid_write_btn)
@@ -2074,7 +2109,6 @@ class MainWindow(QMainWindow):
         self.pid_restore_btn.clicked.connect(self.on_pid_restore)
         self.pid_restore_btn.setEnabled(False)
         buttons.addWidget(self.pid_restore_btn)
-        buttons.addStretch()
         layout.addLayout(buttons)
         return tab
 
@@ -2657,69 +2691,103 @@ class MainWindow(QMainWindow):
                 if peak_notes else "黑匣子噪声峰：未找到明显噪声峰")
         self.statusBar().showMessage("频谱分析完成（点「绘制曲线」返回时域图）")
 
-    # ---------- 页签 3：Rates 调参（v0.5） ----------
+    # ---------- 页签 3：Rates 调参（v0.5，仿 BF Rate 配置文件布局） ----------
+
+    # BF 轴配色：ROLL 红 / PITCH 绿 / YAW 蓝
+    RATE_AXES = [("ROLL", 0, "#E04545"), ("PITCH", 1, "#7CE38B"),
+                 ("YAW", 2, "#3EC6E8")]
+    RATE_FIELDS = [("rc_rate", "RC Rate"), ("rate", "Rate"),
+                   ("expo", "RC Expo")]
 
     def _build_rates_tab(self) -> QWidget:
         tab = QWidget()
         layout = QHBoxLayout(tab)
 
-        # 左列：三轴滑块 + 写入按钮
-        left = QVBoxLayout()
-        hint = QLabel("拖动滑块实时预览手感曲线，确认后点「写入飞控」。"
-                      "写入前会自动备份当前全部配置到 backups/ 文件夹。")
-        hint.setWordWrap(True)
-        left.addWidget(hint)
-
         self._rc_raw = None                   # 23 字节 bytearray
-        self._rates_controls = {}             # {(字段, 轴): (滑块, 数值标签)}
+        self._rates_spins = {}                # {(字段, 轴): QDoubleSpinBox}
+        self._rates_max_labels = {}           # {轴: 满杆角速度标签}
 
-        axes = [("横滚 Roll", 0), ("俯仰 Pitch", 1), ("偏航 Yaw", 2)]
-        fields = [("rc_rate", "中位灵敏度 RC Rate"),
-                  ("rate", "满杆速率 Super Rate"),
-                  ("expo", "中位指数 Expo")]
-        for axis_name, axis in axes:
-            box = QGroupBox(axis_name)
-            grid = QGridLayout(box)
-            for row, (field, field_name) in enumerate(fields):
-                slider = QSlider(Qt.Orientation.Horizontal)
-                slider.setRange(0, 255)       # 存储值 0~255 = 0.00~2.55
-                value_label = QLabel("—")
-                value_label.setMinimumWidth(40)
-                slider.valueChanged.connect(
-                    lambda v, f=field, a=axis: self._on_rates_slider(f, a, v))
-                grid.addWidget(QLabel(field_name), row, 0)
-                grid.addWidget(slider, row, 1)
-                grid.addWidget(value_label, row, 2)
-                self._rates_controls[(field, axis)] = (slider, value_label)
-            left.addWidget(box)
+        # ---- 左列：油门设置 + BF 风格 Rate 表格 + 刷新/保存 ----
+        left = QVBoxLayout()
+
+        # 油门区（对应 BF 的 油门限制/中点/Expo）
+        thr_box = QGroupBox("油门")
+        thr_form = QFormLayout(thr_box)
+        self.thr_limit_spin = QSpinBox()
+        self.thr_limit_spin.setRange(0, 100)
+        self.thr_limit_spin.setSuffix(" %")
+        self.thr_limit_spin.valueChanged.connect(self._on_thr_changed)
+        thr_form.addRow("油门限制百分比：", self.thr_limit_spin)
+        self.thr_mid_spin = QDoubleSpinBox()
+        self.thr_mid_spin.setRange(0.0, 1.0)
+        self.thr_mid_spin.setSingleStep(0.01)
+        self.thr_mid_spin.setDecimals(2)
+        self.thr_mid_spin.valueChanged.connect(self._on_thr_changed)
+        thr_form.addRow("油门中点：", self.thr_mid_spin)
+        self.thr_expo_spin = QDoubleSpinBox()
+        self.thr_expo_spin.setRange(0.0, 1.0)
+        self.thr_expo_spin.setSingleStep(0.01)
+        self.thr_expo_spin.setDecimals(2)
+        self.thr_expo_spin.valueChanged.connect(self._on_thr_changed)
+        thr_form.addRow("油门 Expo：", self.thr_expo_spin)
+        left.addWidget(thr_box)
+
+        # Rate 表格（BF 的 基本/手动 Rate：彩色轴行 + 数字输入列）
+        table_box = QGroupBox("基本 / 手动 Rate")
+        grid = QGridLayout(table_box)
+        grid.addWidget(QLabel(""), 0, 0)
+        for col, (_field, field_name) in enumerate(self.RATE_FIELDS):
+            head = QLabel(field_name)
+            head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(head, 0, col + 1)
+        max_head = QLabel("满杆 deg/s")
+        max_head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(max_head, 0, 4)
+        for row, (axis_name, axis, color) in enumerate(self.RATE_AXES):
+            lab = QLabel(axis_name)
+            lab.setStyleSheet(f"color: {color}; font-weight: bold;")
+            grid.addWidget(lab, row + 1, 0)
+            for col, (field, _name) in enumerate(self.RATE_FIELDS):
+                spin = QDoubleSpinBox()
+                spin.setRange(0.0, 2.55)
+                spin.setSingleStep(0.01)
+                spin.setDecimals(2)
+                spin.valueChanged.connect(
+                    lambda v, f=field, a=axis: self._on_rates_spin(f, a, v))
+                grid.addWidget(spin, row + 1, col + 1)
+                self._rates_spins[(field, axis)] = spin
+            maxlab = QLabel("—")
+            maxlab.setStyleSheet(f"color: {color};")
+            maxlab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(maxlab, row + 1, 4)
+            self._rates_max_labels[axis] = maxlab
+        left.addWidget(table_box)
 
         btns = QHBoxLayout()
-        self.rates_reload_btn = QPushButton("重新读取")
+        btns.addStretch()
+        self.rates_reload_btn = QPushButton("刷新")
         self.rates_reload_btn.clicked.connect(self.on_tuning_reload)
         self.rates_reload_btn.setEnabled(False)
         btns.addWidget(self.rates_reload_btn)
-        self.rates_write_btn = QPushButton("写入飞控")
+        self.rates_write_btn = QPushButton("保存")
         self.rates_write_btn.setObjectName("connectBtn")
         self.rates_write_btn.clicked.connect(self.on_tuning_write)
         self.rates_write_btn.setEnabled(False)
         btns.addWidget(self.rates_write_btn)
-        btns.addStretch()
         left.addLayout(btns)
         left.addStretch()
         layout.addLayout(left, 1)
 
-        # 右列：手感曲线
+        # ---- 右列：Rates 预览 + 油门曲线预览（同一张图上下两轨）----
         right = QVBoxLayout()
-        curve_box = QGroupBox("手感曲线（摇杆偏转 → 角速度）")
+        curve_box = QGroupBox("Rates 预览")
         curve_layout = QVBoxLayout(curve_box)
         if HAS_MPL:
-            self.rates_figure = Figure(figsize=(5, 4), facecolor="#1B1E23")
+            self.rates_figure = Figure(figsize=(5, 6), facecolor="#1B1E23")
             self.rates_canvas = FigureCanvasQTAgg(self.rates_figure)
             curve_layout.addWidget(self.rates_canvas)
         else:
             curve_layout.addWidget(QLabel("未安装 matplotlib，无法绘制曲线"))
-        self.rates_max_label = QLabel("满杆角速度：—")
-        curve_layout.addWidget(self.rates_max_label)
         right.addWidget(curve_box)
         layout.addLayout(right, 1)
         return tab
@@ -2735,12 +2803,19 @@ class MainWindow(QMainWindow):
         try:
             self._rc_raw = bytearray(data["rc_raw"])
             parsed = parse_rc_tuning(bytes(self._rc_raw))
-            for (field, axis), (slider, label) in \
-                    self._rates_controls.items():
-                slider.blockSignals(True)
-                slider.setValue(round(parsed[field][axis] * 100))
-                slider.blockSignals(False)
-                label.setText(f"{parsed[field][axis]:.2f}")
+            for (field, axis), spin in self._rates_spins.items():
+                spin.blockSignals(True)
+                spin.setValue(parsed[field][axis])
+                spin.blockSignals(False)
+            self.thr_mid_spin.blockSignals(True)
+            self.thr_mid_spin.setValue(parsed["thr_mid"])
+            self.thr_mid_spin.blockSignals(False)
+            self.thr_expo_spin.blockSignals(True)
+            self.thr_expo_spin.setValue(parsed["thr_expo"])
+            self.thr_expo_spin.blockSignals(False)
+            self.thr_limit_spin.blockSignals(True)
+            self.thr_limit_spin.setValue(parsed["thr_limit_pct"])
+            self.thr_limit_spin.blockSignals(False)
             self._draw_rates_curve()
             self.rates_write_btn.setEnabled(True)
         except (MspError, KeyError, TypeError):
@@ -2753,56 +2828,94 @@ class MainWindow(QMainWindow):
                 spin.blockSignals(True)
                 spin.setValue(values[key])
                 spin.blockSignals(False)
+            # 滤波器类型下拉
+            for tkey, combo in self._filter_combos.items():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(self._filter_raw[
+                    FILTER_TYPE_FIELDS[tkey]] % len(FILTER_TYPES))
+                combo.blockSignals(False)
+            # 各分组开关：任一受控字段非零即视为启用
+            for toggle, fields, widgets in self._filter_group_list:
+                enabled = any(values.get(k, 0) > 0 for k in fields)
+                toggle.blockSignals(True)
+                toggle.setChecked(enabled)
+                toggle.blockSignals(False)
+                for w in widgets:
+                    w.setEnabled(enabled)
             self.filter_write_btn.setEnabled(True)
         except (MspError, KeyError, TypeError):
             self._filter_raw = None
             self.filter_write_btn.setEnabled(False)
 
-    def _on_rates_slider(self, field: str, axis: int, value: int):
-        """滑块变化：只更新本地数据与曲线，确认后才写飞控"""
+    def _on_rates_spin(self, field: str, axis: int, value: float):
+        """Rate 数字框变化：只更新本地数据与曲线，点「保存」才写飞控"""
         if self._rc_raw is None:
             return
-        set_rc_value(self._rc_raw, field, axis, value / 100)
-        _slider, label = self._rates_controls[(field, axis)]
-        label.setText(f"{value / 100:.2f}")
+        set_rc_value(self._rc_raw, field, axis, value)
+        self._draw_rates_curve()
+
+    def _on_thr_changed(self):
+        """油门中点/Expo/限幅变化"""
+        if self._rc_raw is None:
+            return
+        self._rc_raw[6] = max(0, min(255,
+            round(self.thr_mid_spin.value() * 100)))
+        self._rc_raw[7] = max(0, min(255,
+            round(self.thr_expo_spin.value() * 100)))
+        self._rc_raw[15] = max(0, min(100, self.thr_limit_spin.value()))
         self._draw_rates_curve()
 
     def _draw_rates_curve(self):
-        """按当前滑块值绘制三轴手感曲线"""
+        """按当前数值绘制 BF 风格预览：上 = Rates 曲线，下 = 油门曲线"""
         if not HAS_MPL or self._rc_raw is None:
             return
         parsed = parse_rc_tuning(bytes(self._rc_raw))
         fig = self.rates_figure
         fig.clear()
-        ax = fig.add_subplot(111)
-        ax.set_facecolor("#1B1E23")
+
+        # 上：三轴 Rates 曲线（BF 轴配色）
+        ax1 = fig.add_subplot(211)
+        ax1.set_facecolor("#1B1E23")
         sticks = [i / 100 for i in range(101)]
-        colors = ["#3EC6E8", "#F5A83D", "#7CE38B"]
-        names = ["横滚", "俯仰", "偏航"]
-        maxes = []
-        for axis in range(3):
+        for axis_name, axis, color in self.RATE_AXES:
             curve = [bf_rate_curve(s, parsed["rc_rate"][axis],
                                    parsed["rate"][axis],
                                    parsed["expo"][axis]) for s in sticks]
-            ax.plot([s * 100 for s in sticks], curve, color=colors[axis],
-                    linewidth=1.2, label=names[axis])
-            maxes.append(f"{names[axis]} {curve[-1]:.0f}")
-        title = "手感曲线"
+            ax1.plot([s * 100 for s in sticks], curve, color=color,
+                     linewidth=1.2, label=axis_name)
+            self._rates_max_labels[axis].setText(f"{curve[-1]:.0f}")
+        title = "Rates 预览"
         if parsed.get("rates_type", 0) != 0:
-            title += "（固件使用非经典 Rates 类型，曲线仅供参考）"
-        ax.set_title(title, color="#3EC6E8")
-        ax.set_xlabel("摇杆偏转 (%)", color="#E8E8E8")
-        ax.set_ylabel("角速度 (°/s)", color="#E8E8E8")
-        ax.legend(loc="upper left", fontsize=8, facecolor="#23272E",
-                  labelcolor="#E8E8E8")
-        ax.grid(True, alpha=0.2, color="#9AA0A6")
-        ax.tick_params(colors="#9AA0A6")
-        for spine in ax.spines.values():
+            title += "（固件为非经典类型，仅供参考）"
+        ax1.set_title(title, color="#3EC6E8", fontsize=10)
+        ax1.set_xlabel("摇杆偏转 (%)", color="#E8E8E8", fontsize=8)
+        ax1.set_ylabel("角速度 (°/s)", color="#E8E8E8", fontsize=8)
+        ax1.legend(loc="upper left", fontsize=8, facecolor="#23272E",
+                   labelcolor="#E8E8E8")
+        ax1.grid(True, alpha=0.2, color="#9AA0A6")
+        ax1.tick_params(colors="#9AA0A6", labelsize=8)
+        for spine in ax1.spines.values():
             spine.set_color("#363C44")
+
+        # 下：油门曲线预览（BF 同款：锚定中点的 expo 曲线）
+        ax2 = fig.add_subplot(212)
+        ax2.set_facecolor("#1B1E23")
+        mid, expo = parsed["thr_mid"], parsed["thr_expo"]
+        throttle = [bf_throttle_curve(s, mid, expo) for s in sticks]
+        ax2.plot([s * 100 for s in sticks], [t * 100 for t in throttle],
+                 color="#F5A83D", linewidth=1.2)
+        ax2.plot([mid * 100], [mid * 100], "o", color="#3EC6E8",
+                 markersize=5)
+        ax2.set_title("油门曲线预览", color="#3EC6E8", fontsize=10)
+        ax2.set_xlabel("油门输入 (%)", color="#E8E8E8", fontsize=8)
+        ax2.set_ylabel("油门输出 (%)", color="#E8E8E8", fontsize=8)
+        ax2.grid(True, alpha=0.2, color="#9AA0A6")
+        ax2.tick_params(colors="#9AA0A6", labelsize=8)
+        for spine in ax2.spines.values():
+            spine.set_color("#363C44")
+
         fig.tight_layout()
         self.rates_canvas.draw()
-        self.rates_max_label.setText(
-            "满杆角速度：" + " ｜ ".join(maxes) + " °/s")
 
     def on_tuning_write(self):
         """把 Rates 与滤波器一起写入飞控（一次 EEPROM 保存）"""
@@ -2827,71 +2940,186 @@ class MainWindow(QMainWindow):
         self._run_in_thread(self.worker.write_tuning,
                             list(self._rc_raw), list(self._filter_raw))
 
-    # ---------- 页签 4：滤波器（v0.5） ----------
+    # ---------- 页签 4：滤波器（v0.5，仿 BF 滤波器设置布局） ----------
 
     def _build_filter_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
 
-        hint = QLabel("滤波器用于压制机架振动噪声。截止频率 0 = 关闭该滤波器"
-                      "（危险！）。建议先在「黑匣子」页做频谱分析，"
-                      "找到噪声峰后再调整。")
+        hint = QLabel("截止频率 0 = 关闭该滤波器（危险！）。"
+                      "建议先在「黑匣子」页做频谱分析找到噪声峰后再调整。")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self._filter_raw = None               # 49 字节 bytearray
-        self._filter_spins = {}               # {键名: QSpinBox}
-
-        name_map = {k: n for k, n, _o, _t, _lo, _hi in FILTER_FIELDS}
-        range_map = {k: (lo, hi) for k, _n, _o, _t, lo, hi in FILTER_FIELDS}
-        groups = [
-            ("静态低通（常用）", ["gyro_lpf1_hz", "gyro_lpf2_hz",
-                              "dterm_lpf1_hz", "dterm_lpf2_hz", "yaw_lpf_hz"]),
-            ("动态低通", ["gyro_dyn_min", "gyro_dyn_max",
-                        "dterm_dyn_min", "dterm_dyn_max", "dyn_expo"]),
-            ("动态陷波", ["notch_q", "notch_min", "notch_max", "notch_count"]),
-            ("RPM 滤波", ["rpm_harmonics", "rpm_min_hz"]),
-        ]
-        group_row = QHBoxLayout()
-        for group_name, keys in groups:
-            box = QGroupBox(group_name)
-            form = QFormLayout(box)
-            for key in keys:
-                spin = QSpinBox()
-                lo, hi = range_map[key]
-                spin.setRange(lo, hi)
-                spin.setMaximumWidth(110)
-                spin.valueChanged.connect(
-                    lambda v, k=key: self._on_filter_spin(k, v))
-                form.addRow(name_map[key] + "：", spin)
-                self._filter_spins[key] = spin
-            group_row.addWidget(box)
-        layout.addLayout(group_row)
-
+        outer.addWidget(hint)
         # 与黑匣子频谱联动：显示最近一次 FFT 找到的噪声峰
         self.filter_peak_label = QLabel("黑匣子噪声峰：尚未做频谱分析"
                                         "（黑匣子页 → 频谱分析）")
         self.filter_peak_label.setWordWrap(True)
         self.filter_peak_label.setStyleSheet("color: #9AA0A6;")
-        layout.addWidget(self.filter_peak_label)
+        outer.addWidget(self.filter_peak_label)
 
+        self._filter_raw = None               # 49 字节 bytearray
+        self._filter_spins = {}               # {字段键: QSpinBox}
+        self._filter_combos = {}              # {类型键: QComboBox}
+        self._filter_group_list = []          # [(开关, [受控字段], [组内控件])]
+        self._filter_last = {}                # 关闭前的值，重新打开时恢复
+        self._filter_ranges = {k: (lo, hi)
+                               for k, _n, _o, _t, lo, hi in FILTER_FIELDS}
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        cols = QHBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        # ---- 左列：陀螺仪（独立于 PID 配置文件）----
+        left = QVBoxLayout()
+        lhead = QLabel("陀螺仪（独立于 PID 配置文件）")
+        lhead.setStyleSheet("color: #3EC6E8; font-weight: bold;")
+        left.addWidget(lhead)
+        self._add_filter_group(left, "陀螺仪低通滤波器 1",
+            ["gyro_lpf1_hz", "gyro_dyn_min", "gyro_dyn_max"],
+            {"gyro_lpf1_hz": 250, "gyro_dyn_min": 250, "gyro_dyn_max": 500},
+            [("最低截止频率 (Hz)", "gyro_dyn_min"),
+             ("最高截止频率 (Hz)", "gyro_dyn_max"),
+             ("滤波器类型", "type:gyro_lpf1_type")])
+        self._add_filter_group(left, "陀螺仪低通滤波器 2",
+            ["gyro_lpf2_hz"], {"gyro_lpf2_hz": 500},
+            [("静态截止频率 (Hz)", "gyro_lpf2_hz"),
+             ("滤波器类型", "type:gyro_lpf2_type")])
+        self._add_filter_group(left, "陀螺仪陷波滤波器 1",
+            ["gyro_notch1_hz", "gyro_notch1_cutoff"],
+            {"gyro_notch1_hz": 400, "gyro_notch1_cutoff": 300},
+            [("频率 (Hz)", "gyro_notch1_hz"),
+             ("截止 (Hz)", "gyro_notch1_cutoff")])
+        self._add_filter_group(left, "陀螺仪陷波滤波器 2",
+            ["gyro_notch2_hz", "gyro_notch2_cutoff"],
+            {"gyro_notch2_hz": 200, "gyro_notch2_cutoff": 100},
+            [("频率 (Hz)", "gyro_notch2_hz"),
+             ("截止 (Hz)", "gyro_notch2_cutoff")])
+        self._add_filter_group(left, "陀螺仪 RPM 滤波器",
+            ["rpm_harmonics", "rpm_min_hz"],
+            {"rpm_harmonics": 3, "rpm_min_hz": 100},
+            [("谐波数量", "rpm_harmonics"),
+             ("最低频率 (Hz)", "rpm_min_hz")])
+        self._add_filter_group(left, "动态陷波滤波器",
+            ["notch_count"], {"notch_count": 3},
+            [("陷波数量", "notch_count"),
+             ("Q 因子", "notch_q"),
+             ("最低频率 (Hz)", "notch_min"),
+             ("最高频率 (Hz)", "notch_max")])
+        left.addStretch()
+        cols.addLayout(left, 1)
+
+        # ---- 右列：D Term / 偏航（PID 配置文件关联）----
+        right = QVBoxLayout()
+        rhead = QLabel("D Term / 偏航（PID 配置文件关联）")
+        rhead.setStyleSheet("color: #3EC6E8; font-weight: bold;")
+        right.addWidget(rhead)
+        self._add_filter_group(right, "D Term 低通滤波器 1",
+            ["dterm_lpf1_hz", "dterm_dyn_min", "dterm_dyn_max"],
+            {"dterm_lpf1_hz": 75, "dterm_dyn_min": 75, "dterm_dyn_max": 150},
+            [("最低截止频率 (Hz)", "dterm_dyn_min"),
+             ("最高截止频率 (Hz)", "dterm_dyn_max"),
+             ("动态曲线 Expo", "dyn_expo"),
+             ("滤波器类型", "type:dterm_lpf1_type")])
+        self._add_filter_group(right, "D Term 低通滤波器 2",
+            ["dterm_lpf2_hz"], {"dterm_lpf2_hz": 150},
+            [("静态截止频率 (Hz)", "dterm_lpf2_hz"),
+             ("滤波器类型", "type:dterm_lpf2_type")])
+        self._add_filter_group(right, "D Term 陷波滤波器",
+            ["dterm_notch_hz", "dterm_notch_cutoff"],
+            {"dterm_notch_hz": 300, "dterm_notch_cutoff": 250},
+            [("频率 (Hz)", "dterm_notch_hz"),
+             ("截止 (Hz)", "dterm_notch_cutoff")])
+        self._add_filter_group(right, "偏航低通滤波器",
+            ["yaw_lpf_hz"], {"yaw_lpf_hz": 100},
+            [("静态截止频率 (Hz)", "yaw_lpf_hz")])
+        right.addStretch()
+        cols.addLayout(right, 1)
+
+        # ---- 底部：刷新 / 保存（BF 右下角风格）----
         btns = QHBoxLayout()
-        self.filter_reload_btn = QPushButton("重新读取")
+        btns.addStretch()
+        self.filter_reload_btn = QPushButton("刷新")
         self.filter_reload_btn.clicked.connect(self.on_tuning_reload)
         self.filter_reload_btn.setEnabled(False)
         btns.addWidget(self.filter_reload_btn)
-        self.filter_write_btn = QPushButton("写入飞控")
+        self.filter_write_btn = QPushButton("保存")
         self.filter_write_btn.setObjectName("connectBtn")
         self.filter_write_btn.clicked.connect(self.on_tuning_write)
         self.filter_write_btn.setEnabled(False)
         btns.addWidget(self.filter_write_btn)
-        btns.addStretch()
-        layout.addLayout(btns)
-        layout.addStretch()
+        outer.addLayout(btns)
         return tab
 
+    def _add_filter_group(self, layout, title: str, fields: list,
+                          defaults: dict, rows: list):
+        """创建一个滤波器分组（仿 BF）：胶囊开关 + 数值行/类型下拉"""
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        toggle = ToggleSwitch()
+        toggle.setToolTip("关闭 = 该滤波器的频率全部写 0（与 BF 一致）")
+        form.addRow("启用：", toggle)
+        widgets = []
+        for label, key in rows:
+            if key.startswith("type:"):
+                combo = QComboBox()
+                combo.addItems(FILTER_TYPES)
+                tkey = key[5:]
+                combo.currentIndexChanged.connect(
+                    lambda i, k=tkey: self._on_filter_type(k, i))
+                form.addRow(label + "：", combo)
+                self._filter_combos[tkey] = combo
+                widgets.append(combo)
+            else:
+                spin = QSpinBox()
+                lo, hi = self._filter_ranges[key]
+                spin.setRange(lo, hi)
+                spin.setMaximumWidth(110)
+                spin.valueChanged.connect(
+                    lambda v, k=key: self._on_filter_spin(k, v))
+                form.addRow(label + "：", spin)
+                self._filter_spins[key] = spin
+                widgets.append(spin)
+        toggle.toggled.connect(
+            lambda on, f=fields, d=defaults, w=widgets:
+                self._on_filter_toggle(f, d, w, on))
+        self._filter_group_list.append((toggle, fields, widgets))
+        layout.addWidget(box)
+
+    def _on_filter_toggle(self, fields: list, defaults: dict,
+                          widgets: list, on: bool):
+        """分组开关：开 = 恢复上次值（或默认）；关 = 全部写 0（同 BF）"""
+        if self._filter_raw is None:
+            return
+        if on:
+            for key in fields:
+                value = self._filter_last.get(key, defaults.get(key, 0))
+                set_filter_value(self._filter_raw, key, value)
+        else:
+            current = parse_filter_config(bytes(self._filter_raw))
+            for key in fields:
+                self._filter_last[key] = current.get(key, 0)
+                set_filter_value(self._filter_raw, key, 0)
+        values = parse_filter_config(bytes(self._filter_raw))
+        for key in fields:
+            spin = self._filter_spins.get(key)
+            if spin is not None:
+                spin.blockSignals(True)
+                spin.setValue(values[key])
+                spin.blockSignals(False)
+        for w in widgets:
+            w.setEnabled(on)
+
+    def _on_filter_type(self, tkey: str, index: int):
+        """滤波器类型下拉变化"""
+        if self._filter_raw is None:
+            return
+        self._filter_raw[FILTER_TYPE_FIELDS[tkey]] = index
+
     def _on_filter_spin(self, key: str, value: int):
-        """滤波器数值变化：只更新本地数据，确认后才写飞控"""
+        """滤波器数值变化：只更新本地数据，点「保存」才写飞控"""
         if self._filter_raw is None:
             return
         set_filter_value(self._filter_raw, key, value)
@@ -3349,6 +3577,14 @@ class MainWindow(QMainWindow):
         self._pid_names = names
         self.pid_table.setRowCount(len(names))
         self.pid_table.setVerticalHeaderLabels(names)
+        # BF 轴配色：ROLL 红 / PITCH 绿 / YAW 蓝（只染前三行）
+        for row, (prefix, color) in enumerate(
+                [("Roll", "#E04545"), ("Pitch", "#7CE38B"),
+                 ("Yaw", "#3EC6E8")]):
+            if row < len(names) and names[row].startswith(prefix):
+                item = self.pid_table.verticalHeaderItem(row)
+                if item:
+                    item.setForeground(QColor(color))
         for row, (p, i_val, d) in enumerate(values):
             for col, v in enumerate((p, i_val, d)):
                 self.pid_table.setItem(row, col, QTableWidgetItem(str(v)))
