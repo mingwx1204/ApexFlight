@@ -64,7 +64,7 @@ check("单日志绘图正常", True)
 
 # 5. 渲染全部页面截图
 n_pages = win.pages.count() if hasattr(win, "pages") else 0
-check("存在 10 个页面", n_pages == 10, f"实际 {n_pages}")
+check("存在 11 个页面", n_pages == 11, f"实际 {n_pages}")
 for i in range(n_pages):
     try:
         if hasattr(win, "sidebar"):
@@ -118,7 +118,7 @@ i18n.set_language("en")
 win.retranslate_ui()
 app.processEvents()
 item0 = win.sidebar.item(0).text()
-check("英文侧栏", "Dashboard" in item0, item0)
+check("英文侧栏", "Welcome" in item0 and "Dashboard" in win.sidebar.item(1).text(), item0)
 check("英文顶栏按钮", win.connect_button.text() == "Connect")
 # 页面内部也应切换：仪表盘分组、Rates 分组、按钮
 from PyQt6.QtWidgets import QGroupBox as _GB, QPushButton as _PB, QLabel
@@ -136,7 +136,7 @@ check("英文滤波器字段", any("Min cutoff (Hz)" in l for l in labels))
 i18n.set_language("zh")
 win.retranslate_ui()
 app.processEvents()
-check("切回中文侧栏", "仪表盘" in win.sidebar.item(0).text())
+check("切回中文侧栏", "欢迎" in win.sidebar.item(0).text() and "仪表盘" in win.sidebar.item(1).text())
 check("切回中文按钮", win.connect_button.text() == "连接")
 titles_zh = {w.title() for w in win.findChildren(_GB)}
 check("中文还原（飞控信息）", "飞控信息" in titles_zh)

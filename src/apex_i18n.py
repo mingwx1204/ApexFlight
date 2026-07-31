@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.91"
+APP_VERSION = "0.92"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -28,6 +28,7 @@ _current_lang = "zh"
 # 中文原文 → English
 _EN = {
     # ---- 侧栏 / 顶栏 / 通用按钮 ----
+    "欢迎": "Welcome",
     "仪表盘": "Dashboard", "PID 调参": "PID Tuning", "Rates 调参": "Rates",
     "滤波器": "Filters", "电机测试": "Motors", "接收机": "Receiver",
     "黑匣子": "Blackbox", "调参方案": "Presets", "AI 助手": "AI Assistant",
@@ -54,6 +55,30 @@ _EN = {
     "诊断信息已复制，到 GitHub Issues 粘贴即可": 
         "Diagnostics copied - paste them into the GitHub issue",
     "在 GitHub 上提交建议/问题": "Report issues or suggestions on GitHub",
+    # ---- 欢迎页（v0.92）----
+    "开源 FPV 无人机调参软件": "Open-source FPV drone tuning tool",
+    "全本地运行 · 零云端 · 保护飞手隐私":
+        "Fully local, zero cloud - your flight data never leaves this PC",
+    "快速上手": "Quick start",
+    "① 插入飞控 USB，关闭 Betaflight Configurator（串口独占）":
+        "1. Plug in the FC via USB; close Betaflight Configurator (port is exclusive)",
+    "② 顶栏选择串口，点击「连接」":
+        "2. Pick the port in the top bar, then click [Connect]",
+    "③ 仪表盘查看姿态与状态，到 PID / Rates 页开始调参":
+        "3. Check attitude on Dashboard, then tune in PID / Rates",
+    "QQ 交流群": "QQ Group",
+    "扫码或搜群号加入，一起交流调参心得":
+        "Scan the code or search the group number to chat tuning with us",
+    "群号：": "Group No.:",
+    "复制群号": "Copy No.",
+    "联系作者": "Contact the Author",
+    "有建议或合作意向，欢迎来邮": "Suggestions or cooperation? Drop an email",
+    "复制邮箱": "Copy email",
+    "开源社区": "Open Source",
+    "代码开源（GPL-3.0），欢迎 Star / Issue / PR":
+        "Open source (GPL-3.0) - stars, issues and PRs are welcome",
+    "打开 GitHub 仓库": "Open GitHub repo",
+    "已复制到剪贴板": "Copied to clipboard",
     "语言已切换：界面已立即生效（状态栏等动态提示保持中文）。":
         "Language switched. (Dynamic status messages remain in Chinese.)",
     # ---- 日志页 ----

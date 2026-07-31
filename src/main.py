@@ -856,6 +856,7 @@ class MainWindow(QMainWindow):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # 隐藏横向滚动条
         # 侧栏条目 = 图标 + 名称键（名称键用于 i18n 翻译）
         self._sidebar_entries = [
+            ("👋", "欢迎"),
             ("📊", "仪表盘"), ("🎛️", "PID 调参"), ("🎯", "Rates 调参"),
             ("🌊", "滤波器"), ("⚙️", "电机测试"), ("📡", "接收机"),
             ("📈", "黑匣子"), ("💾", "调参方案"), ("🤖", "AI 助手"),
@@ -867,6 +868,7 @@ class MainWindow(QMainWindow):
         body.addWidget(self.sidebar)
 
         self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_welcome_tab())
         self.pages.addWidget(self._build_dashboard_tab())
         self.pages.addWidget(self._build_pid_tab())
         self.pages.addWidget(self._build_rates_tab())
@@ -1108,6 +1110,140 @@ class MainWindow(QMainWindow):
                         w.setText(new)
             except RuntimeError:
                 pass                      # 控件可能已被销毁
+
+    # ---------- 页签 0：欢迎（v0.92，参考 BF 欢迎页） ----------
+
+    QQ_GROUP_NUMBER = "1045772754"
+    AUTHOR_EMAIL = "1693161698@qq.com"
+    REPO_URL = "https://github.com/mingwx1204/ApexFlight"
+
+    def _copy_text(self, text: str):
+        """复制文本到剪贴板并提示（欢迎页：群号/邮箱）"""
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage(
+            tr("已复制到剪贴板") + f"：{text}", 3000)
+
+    def _build_welcome_tab(self) -> QWidget:
+        """欢迎页（v0.92，参考 BF 欢迎页）：品牌区 + 快速上手 +
+        QQ 交流群 / 联系作者 / 开源社区三张卡片"""
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(26, 18, 26, 18)
+        outer.setSpacing(14)
+
+        # ---- 品牌区：图标 + 名称 + 版本 + 标语 ----
+        brand = QVBoxLayout()
+        brand.setSpacing(5)
+        if ICON_PATH.exists():
+            icon = QLabel()
+            icon.setPixmap(QPixmap(str(ICON_PATH)).scaled(
+                100, 100, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            brand.addWidget(icon)
+        name = QLabel("ApexFlight")
+        name.setStyleSheet("color: #3EC6E8; font-size: 30px; "
+                           "font-weight: bold;")
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(name)
+        ver = QLabel(f"v{i18n.APP_VERSION} · GPL-3.0")
+        ver.setStyleSheet("color: #7A828C; font-size: 12px;")
+        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(ver)
+        tag = QLabel(tr("开源 FPV 无人机调参软件"))
+        tag.setStyleSheet("color: #E8E8E8; font-size: 14px;")
+        tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(tag)
+        sub = QLabel(tr("全本地运行 · 零云端 · 保护飞手隐私"))
+        sub.setStyleSheet("color: #9AA0A6;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(sub)
+        outer.addLayout(brand)
+
+        # ---- 快速上手 ----
+        quick = QGroupBox("🚀 " + tr("快速上手"))
+        qv = QVBoxLayout(quick)
+        for s in ("① 插入飞控 USB，关闭 Betaflight Configurator（串口独占）",
+                  "② 顶栏选择串口，点击「连接」",
+                  "③ 仪表盘查看姿态与状态，到 PID / Rates 页开始调参"):
+            lab = QLabel(tr(s))
+            lab.setStyleSheet("color: #C8CDD3; padding: 2px 4px;")
+            qv.addWidget(lab)
+        outer.addWidget(quick)
+
+        # ---- 三张卡片：QQ 群 / 联系作者 / 开源社区 ----
+        cards = QHBoxLayout()
+        cards.setSpacing(14)
+
+        # QQ 交流群卡
+        qq = QGroupBox("📡 " + tr("QQ 交流群"))
+        qql = QVBoxLayout(qq)
+        if QQ_QR_PATH.exists():
+            qr = QLabel()
+            qr.setPixmap(QPixmap(str(QQ_QR_PATH)).scaled(
+                170, 170, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            qql.addWidget(qr)
+        hint = QLabel(tr("扫码或搜群号加入，一起交流调参心得"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9AA0A6;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qql.addWidget(hint)
+        qq_row = QHBoxLayout()
+        no = QLabel(tr("群号：") + self.QQ_GROUP_NUMBER)
+        no.setStyleSheet("color: #3EC6E8; font-weight: bold;")
+        qq_row.addWidget(no, 1)
+        copy_qq = QPushButton(tr("复制群号"))
+        copy_qq.clicked.connect(
+            lambda: self._copy_text(self.QQ_GROUP_NUMBER))
+        qq_row.addWidget(copy_qq)
+        qql.addLayout(qq_row)
+        cards.addWidget(qq)
+
+        # 联系作者卡
+        mail = QGroupBox("📧 " + tr("联系作者"))
+        ml = QVBoxLayout(mail)
+        ml.addStretch()
+        mh = QLabel(tr("有建议或合作意向，欢迎来邮"))
+        mh.setWordWrap(True)
+        mh.setStyleSheet("color: #9AA0A6;")
+        mh.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ml.addWidget(mh)
+        addr = QLabel(self.AUTHOR_EMAIL)
+        addr.setStyleSheet("color: #3EC6E8; font-size: 15px; "
+                           "font-weight: bold;")
+        addr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ml.addWidget(addr)
+        copy_mail = QPushButton(tr("复制邮箱"))
+        copy_mail.clicked.connect(
+            lambda: self._copy_text(self.AUTHOR_EMAIL))
+        ml.addWidget(copy_mail, alignment=Qt.AlignmentFlag.AlignCenter)
+        ml.addStretch()
+        cards.addWidget(mail)
+
+        # 开源社区卡
+        gh = QGroupBox("🐙 " + tr("开源社区"))
+        gl = QVBoxLayout(gh)
+        gl.addStretch()
+        gh_hint = QLabel(tr("代码开源（GPL-3.0），欢迎 Star / Issue / PR"))
+        gh_hint.setWordWrap(True)
+        gh_hint.setStyleSheet("color: #9AA0A6;")
+        gh_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gl.addWidget(gh_hint)
+        repo_btn = QPushButton("🐙 " + tr("打开 GitHub 仓库"))
+        repo_btn.clicked.connect(
+            lambda: __import__("webbrowser").open(self.REPO_URL))
+        gl.addWidget(repo_btn)
+        fb_btn = QPushButton("💬 " + tr("在 GitHub 上提交建议/问题"))
+        fb_btn.clicked.connect(self._open_feedback)
+        gl.addWidget(fb_btn)
+        gl.addStretch()
+        cards.addWidget(gh)
+
+        outer.addLayout(cards)
+        outer.addStretch()
+        return tab
 
     # ---------- 页签 1：仪表盘 ----------
 
@@ -1873,7 +2009,7 @@ class MainWindow(QMainWindow):
                 + f"\n我正在查看的通道："
                   f"{'、'.join(selected) if selected else '（未选择）'}\n"
                 + "\n".join(f"{k}：{v}" for k, v in stats.items()))
-        self.sidebar.setCurrentRow(8)         # 切到 AI 助手页
+        self.sidebar.setCurrentRow(9)         # 切到 AI 助手页（v0.92 起前面多了欢迎页）
         self._ai_ask(prompt)
 
     # ---------- 黑匣子：频谱分析（FFT）----------

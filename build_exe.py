@@ -45,6 +45,7 @@ def main():
         f"--workpath={ROOT / 'build'}",
         f"--specpath={ROOT}",
         "--add-data", f"{ROOT / 'assets' / 'icon.png'};assets",
+        "--add-data", f"{ROOT / 'assets' / 'qq_group_qr.png'};assets",
         # 隐藏导入：PyQt6/matplotlib 的钩子一般自动处理，这里兜底
         "--hidden-import=serial.tools.list_ports",
         "--hidden-import=matplotlib.backends.backend_qtagg",

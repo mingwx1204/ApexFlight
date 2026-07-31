@@ -23,6 +23,8 @@ else:
     _BUNDLE_ROOT = PROJECT_ROOT
 BACKUP_DIR = PROJECT_ROOT / "backups"
 ICON_PATH = _BUNDLE_ROOT / "assets" / "icon.png"
+# QQ 交流群二维码（欢迎页展示）
+QQ_QR_PATH = _BUNDLE_ROOT / "assets" / "qq_group_qr.png"
 # 官方黑匣子解码器（cleanflight/blackbox-tools，可把 .bbl/.bfl 转成 CSV）
 BLACKBOX_DECODER = _BUNDLE_ROOT / "tools" / "blackbox_decode.exe"
 # 演示日志存放目录
