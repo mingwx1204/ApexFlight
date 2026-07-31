@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 ApexFlight —— 开源无人机调参软件
-v0.4：实时仪表盘 + PID 在线调参（写入/备份/恢复）+ 电机测试 + 接收机通道监视
-      + 黑匣子分析（文件/闪存下载/频谱）+ 本地 AI 助手（Ollama）
+v0.5：实时仪表盘 + PID 在线调参（写入/备份/恢复）+ Rates 调参（曲线可视化）
+      + 滤波器设置（与黑匣子频谱联动）+ 调参方案管理（预设保存/一键切换）
+      + 电机测试 + 接收机通道监视 + 黑匣子分析（文件/闪存下载/频谱）
+      + 本地 AI 助手（Ollama）
 
 运行方式：
     1. 安装依赖：  pip install -r requirements.txt
@@ -35,7 +37,7 @@ from PyQt6.QtWidgets import (
     QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QScrollArea, QSlider, QStackedWidget,
+    QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
     QTableWidget, QTableWidgetItem, QTextEdit, QLineEdit, QVBoxLayout, QWidget,
 )
 
@@ -80,6 +82,10 @@ MSP_EEPROM_WRITE = 250   # 把当前配置保存到飞控闪存（断电不丢�
 MSP_DATAFLASH_SUMMARY = 70   # 板载闪存信息（黑匣子存储芯片）
 MSP_DATAFLASH_READ = 71      # 读取板载闪存数据（黑匣子日志原始字节）
 MSP_DATAFLASH_ERASE = 72     # 清空板载闪存（擦除整颗芯片，耗时几十秒）
+MSP_FILTER_CONFIG = 92       # 读取滤波器配置（低通/陷波/RPM 滤波）
+MSP_SET_FILTER_CONFIG = 93   # 写入滤波器配置
+MSP_RC_TUNING = 111          # 读取 Rates/Expo/油门曲线等摇杆调参
+MSP_SET_RC_TUNING = 204      # 写入摇杆调参
 
 # MSP_IDENT 返回的机型代码对照表（老固件用）
 MULTITYPE_NAMES = {
@@ -418,6 +424,175 @@ def write_pid(ser: serial.Serial, values: list, save_eeprom: bool = True):
     if save_eeprom:
         # 保存到闪存耗时较长（飞控要写 Flash），超时放宽到 5 秒
         msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
+
+
+# ------------------------------------------------------------
+# Rates / 摇杆调参（MSP_RC_TUNING / MSP_SET_RC_TUNING）
+# ------------------------------------------------------------
+# Betaflight 4.5 的 MSP_RC_TUNING 响应布局（23 字节，与固件 msp.c 一致）：
+#   0  rcRates[横滚]      1  rcExpo[横滚]      2~4 rates[横滚/俯仰/偏航]
+#   5  (旧 tpa_rate，已废弃) 6 油门中点  7 油门 expo  8~9 (旧 tpa 断点 u16)
+#   10 rcExpo[偏航]  11 rcRates[偏航]  12 rcRates[俯仰]  13 rcExpo[俯仰]
+#   14 油门限幅类型  15 油门限幅百分比
+#   16~21 三轴角速度上限（u16 × 3）  22 Rates 类型（0=Betaflight 经典）
+# 所有比例值存储为 百分数整数（150 = 1.50）。
+# 写入策略：先完整读取 23 字节，只修改我们理解的字节，原样写回其余字节
+# （read-modify-write），未知/废弃字段保持不变，兼容性最好。
+
+def query_rc_tuning(ser: serial.Serial) -> bytes:
+    """读取 Rates 调参原始数据（MSP_RC_TUNING），返回原始字节串"""
+    return msp_request(ser, MSP_RC_TUNING)
+
+
+def write_rc_tuning(ser: serial.Serial, raw: bytes, save_eeprom: bool = True):
+    """把修改后的 23 字节 Rates 数据写回飞控"""
+    msp_request(ser, MSP_SET_RC_TUNING, bytes(raw))
+    if save_eeprom:
+        msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
+
+
+# 三个可调字段 × 三轴（横滚/俯仰/偏航）在 23 字节中的偏移
+RC_FIELD_OFFSETS = {
+    "rc_rate": [0, 12, 11],     # 中位灵敏度（RC Rate）
+    "expo":    [1, 13, 10],     # 中位指数（Expo）
+    "rate":    [2, 3, 4],       # 满杆速率（Super Rate）
+}
+
+
+def parse_rc_tuning(raw: bytes) -> dict:
+    """把 23 字节原始数据解析成可读字典（比例值已除以 100）"""
+    if len(raw) < 23:
+        raise MspError(f"Rates 数据长度异常：实际 {len(raw)} 字节（需 23）")
+    return {
+        "rc_rate": [raw[0] / 100, raw[12] / 100, raw[11] / 100],  # R, P, Y
+        "expo":    [raw[1] / 100, raw[13] / 100, raw[10] / 100],
+        "rate":    [raw[2] / 100, raw[3] / 100, raw[4] / 100],
+        "thr_mid": raw[6] / 100,
+        "thr_expo": raw[7] / 100,
+        "thr_limit_pct": raw[15],
+        "rate_limit": [u16(raw, 16), u16(raw, 18), u16(raw, 20)],
+        "rates_type": raw[22],
+    }
+
+
+def set_rc_value(raw: bytearray, field: str, axis: int, value: float):
+    """修改某轴某字段（value 为浮点比例值，如 1.50），写回 bytearray"""
+    raw[RC_FIELD_OFFSETS[field][axis]] = max(0, min(255, round(value * 100)))
+
+
+def bf_rate_curve(stick: float, rc_rate: float, super_rate: float,
+                  expo: float) -> float:
+    """
+    Betaflight 经典 Rates 公式：摇杆偏转 0~1 → 角速度（°/s）。
+    中位附近由 rc_rate/expo 决定，满杆由 super_rate 拉升。
+    """
+    xe = stick * (1 - expo) + stick ** 3 * expo
+    denom = max(0.01, 1 - super_rate * abs(xe))
+    return 200 * rc_rate * xe / denom
+
+
+# ------------------------------------------------------------
+# 滤波器配置（MSP_FILTER_CONFIG / MSP_SET_FILTER_CONFIG）
+# ------------------------------------------------------------
+# Betaflight 4.5 的 MSP_FILTER_CONFIG 响应布局（49 字节，与固件 msp.c 一致）。
+# 同样采用 read-modify-write：只改下表列出的字节，其余原样写回。
+#   字段定义：（键名, 中文显示名, 字节偏移, 类型, 最小值, 最大值）
+FILTER_FIELDS = [
+    ("gyro_lpf1_hz",  "陀螺仪低通 1 截止频率 (Hz)", 20, "u16", 0, 1000),
+    ("gyro_lpf2_hz",  "陀螺仪低通 2 截止频率 (Hz)", 22, "u16", 0, 1000),
+    ("dterm_lpf1_hz", "D 项低通 1 截止频率 (Hz)",   1,  "u16", 0, 500),
+    ("dterm_lpf2_hz", "D 项低通 2 截止频率 (Hz)",   26, "u16", 0, 500),
+    ("yaw_lpf_hz",    "偏航低通截止频率 (Hz)",       3,  "u16", 0, 500),
+    ("gyro_dyn_min",  "陀螺仪动态低通·下限 (Hz)",   29, "u16", 0, 1000),
+    ("gyro_dyn_max",  "陀螺仪动态低通·上限 (Hz)",   31, "u16", 0, 1000),
+    ("dterm_dyn_min", "D 项动态低通·下限 (Hz)",     33, "u16", 0, 500),
+    ("dterm_dyn_max", "D 项动态低通·上限 (Hz)",     35, "u16", 0, 500),
+    ("notch_q",       "动态陷波 Q 值",              39, "u16", 1, 1000),
+    ("notch_min",     "动态陷波·最低频率 (Hz)",     41, "u16", 0, 1000),
+    ("notch_max",     "动态陷波·最高频率 (Hz)",     45, "u16", 0, 1000),
+    ("notch_count",   "动态陷波·数量",              48, "u8",  0, 5),
+    ("dyn_expo",      "D 项动态低通 expo",          47, "u8",  0, 10),
+    ("rpm_harmonics", "RPM 滤波·谐波数量",          43, "u8",  0, 3),
+    ("rpm_min_hz",    "RPM 滤波·最低频率 (Hz)",     44, "u8",  0, 255),
+]
+
+
+def query_filter_config(ser: serial.Serial) -> bytes:
+    """读取滤波器配置原始数据（MSP_FILTER_CONFIG）"""
+    return msp_request(ser, MSP_FILTER_CONFIG)
+
+
+def write_filter_config(ser: serial.Serial, raw: bytes,
+                        save_eeprom: bool = True):
+    """把修改后的滤波器配置写回飞控"""
+    msp_request(ser, MSP_SET_FILTER_CONFIG, bytes(raw))
+    if save_eeprom:
+        msp_request(ser, MSP_EEPROM_WRITE, b"", timeout=5.0)
+
+
+def parse_filter_config(raw: bytes) -> dict:
+    """把滤波器原始数据解析成 {键名: 整数值}"""
+    if len(raw) < 49:
+        raise MspError(f"滤波器数据长度异常：实际 {len(raw)} 字节（需 49）")
+    result = {}
+    for key, _name, offset, kind, _lo, _hi in FILTER_FIELDS:
+        result[key] = u16(raw, offset) if kind == "u16" else raw[offset]
+    return result
+
+
+def set_filter_value(raw: bytearray, key: str, value: int):
+    """修改某个滤波器字段，写回 bytearray"""
+    for k, _name, offset, kind, lo, hi in FILTER_FIELDS:
+        if k == key:
+            value = max(lo, min(hi, int(value)))
+            if kind == "u16":
+                raw[offset] = value & 0xFF
+                raw[offset + 1] = (value >> 8) & 0xFF
+            else:
+                raw[offset] = value & 0xFF
+            if key == "gyro_lpf1_hz":
+                # 偏移 0 处还有一个旧版单字节副本，保持同步
+                raw[0] = value & 0xFF
+            return
+    raise KeyError(f"未知滤波器字段：{key}")
+
+
+# ------------------------------------------------------------
+# 调参方案（预设）：PID + Rates + 滤波器 整体快照
+# ------------------------------------------------------------
+PRESETS_DIR = PROJECT_ROOT / "presets"
+
+
+def tuning_snapshot(info: dict, pid_names: list, pid_values: list,
+                    rc_raw: bytes, filter_raw: bytes,
+                    name: str = "") -> dict:
+    """把当前全部调参状态打包成一个字典（用于保存预设或写入前备份）"""
+    return {
+        "software": "ApexFlight",
+        "version": "0.5",
+        "name": name,
+        "saved_time": datetime.now().isoformat(timespec="seconds"),
+        "firmware": info.get("firmware", "未知"),
+        "board": info.get("board", "未知"),
+        "pid_names": pid_names,
+        "pid_values": [list(v) for v in pid_values],
+        "rc_tuning_raw": list(rc_raw),
+        "filter_raw": list(filter_raw),
+    }
+
+
+def save_preset_file(directory: Path, filename: str, snapshot: dict) -> Path:
+    """把调参快照保存为 JSON 文件，返回路径"""
+    directory.mkdir(exist_ok=True)
+    path = directory / filename
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return path
+
+
+def load_preset_file(path: Path) -> dict:
+    """读取预设 JSON 文件"""
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def query_status_ex(ser: serial.Serial) -> dict:
@@ -866,6 +1041,8 @@ class SerialWorker(QObject):
     motor_count_ready = pyqtSignal(int)       # 电机通道数
     flash_progress = pyqtSignal(str)          # 闪存下载进度提示
     flash_done = pyqtSignal(str)              # 闪存黑匣子下载完成（文件路径）
+    tuning_ready = pyqtSignal(dict)           # Rates/滤波器读取成功
+                                            # {"rc_raw": [23字节], "filter_raw": [49字节]}
     error = pyqtSignal(str)                   # 错误信息
     status = pyqtSignal(str)                  # 状态栏提示
 
@@ -902,6 +1079,16 @@ class SerialWorker(QObject):
                 self.motor_count_ready.emit(count)
             except MspError:
                 pass
+
+            # 连接后顺带读取 Rates / 滤波器配置（v0.5）
+            try:
+                self.status.emit("正在读取 Rates 与滤波器配置……")
+                rc_raw = query_rc_tuning(self.serial_port)
+                filter_raw = query_filter_config(self.serial_port)
+                self.tuning_ready.emit({"rc_raw": list(rc_raw),
+                                        "filter_raw": list(filter_raw)})
+            except MspError:
+                pass                          # 个别固件不支持则跳过
 
             self.status.emit("就绪")
 
@@ -1099,6 +1286,116 @@ class SerialWorker(QObject):
             self.error.emit(f"闪存下载失败：{e}")
         except Exception as e:
             self.error.emit(f"闪存下载发生未知错误：{e}")
+
+    # ---------- Rates / 滤波器读写（v0.5） ----------
+
+    def read_tuning(self):
+        """重新读取 Rates 与滤波器配置"""
+        if not self.is_connected:
+            self.error.emit("未连接飞控")
+            return
+        try:
+            self.status.emit("正在读取 Rates 与滤波器配置……")
+            rc_raw = query_rc_tuning(self.serial_port)
+            filter_raw = query_filter_config(self.serial_port)
+            self.tuning_ready.emit({"rc_raw": list(rc_raw),
+                                    "filter_raw": list(filter_raw)})
+            self.status.emit("Rates / 滤波器已读取")
+        except (MspError, serial.SerialException) as e:
+            self.error.emit(f"读取调参配置失败：{e}")
+
+    def write_tuning(self, rc_raw: list, filter_raw: list):
+        """写入 Rates + 滤波器配置（写入前自动做全量快照备份）"""
+        if not self.is_connected:
+            self.error.emit("未连接飞控")
+            return
+        try:
+            self._snapshot_backup()
+            self.status.emit("正在写入 Rates / 滤波器配置……")
+            write_rc_tuning(self.serial_port, bytes(rc_raw), save_eeprom=False)
+            write_filter_config(self.serial_port, bytes(filter_raw),
+                                save_eeprom=False)
+            msp_request(self.serial_port, MSP_EEPROM_WRITE, b"", timeout=5.0)
+            # 重新读取确认
+            rc2 = query_rc_tuning(self.serial_port)
+            filt2 = query_filter_config(self.serial_port)
+            self.tuning_ready.emit({"rc_raw": list(rc2),
+                                    "filter_raw": list(filt2)})
+            self.write_done.emit("Rates / 滤波器配置已写入并保存 ✅")
+        except (MspError, serial.SerialException) as e:
+            self.error.emit(f"写入失败：{e}")
+        except Exception as e:
+            self.error.emit(f"写入时发生未知错误：{e}")
+
+    # ---------- 调参方案（预设） ----------
+
+    def _snapshot_backup(self) -> Path:
+        """把当前 PID+Rates+滤波器 整体快照存到 backups/（写入类操作前调用）"""
+        names, values = query_pid(self.serial_port)
+        rc_raw = query_rc_tuning(self.serial_port)
+        filter_raw = query_filter_config(self.serial_port)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap = tuning_snapshot(self.fc_info, names, values,
+                               rc_raw, filter_raw,
+                               name=f"写入前自动备份 {timestamp}")
+        path = save_preset_file(BACKUP_DIR,
+                                f"full_backup_{timestamp}.json", snap)
+        self.backup_done.emit(str(path))
+        return path
+
+    def capture_preset(self, name: str):
+        """读取飞控当前全部调参状态，保存为预设文件"""
+        if not self.is_connected:
+            self.error.emit("未连接飞控")
+            return
+        try:
+            self.status.emit("正在读取飞控当前配置……")
+            names, values = query_pid(self.serial_port)
+            rc_raw = query_rc_tuning(self.serial_port)
+            filter_raw = query_filter_config(self.serial_port)
+            snap = tuning_snapshot(self.fc_info, names, values,
+                                   rc_raw, filter_raw, name=name)
+            safe = "".join(c for c in name
+                           if c not in '\\/:*?"<>|').strip() or "preset"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = save_preset_file(PRESETS_DIR,
+                                    f"{safe}_{timestamp}.json", snap)
+            self.write_done.emit(f"预设已保存 ✅\n{path}")
+        except (MspError, serial.SerialException) as e:
+            self.error.emit(f"保存预设失败：{e}")
+        except Exception as e:
+            self.error.emit(f"保存预设时发生未知错误：{e}")
+
+    def apply_preset(self, preset: dict):
+        """把预设完整写回飞控（PID + Rates + 滤波器），写入前自动备份"""
+        if not self.is_connected:
+            self.error.emit("未连接飞控")
+            return
+        try:
+            self._snapshot_backup()
+            self.status.emit("正在写入预设……")
+            pid_values = [tuple(v) for v in preset["pid_values"]]
+            write_pid(self.serial_port, pid_values, save_eeprom=False)
+            write_rc_tuning(self.serial_port,
+                            bytes(preset["rc_tuning_raw"]), save_eeprom=False)
+            write_filter_config(self.serial_port,
+                                bytes(preset["filter_raw"]), save_eeprom=False)
+            msp_request(self.serial_port, MSP_EEPROM_WRITE, b"", timeout=5.0)
+            # 重新读取，刷新界面
+            names2, values2 = query_pid(self.serial_port)
+            self.pid_ready.emit(names2, values2)
+            rc2 = query_rc_tuning(self.serial_port)
+            filt2 = query_filter_config(self.serial_port)
+            self.tuning_ready.emit({"rc_raw": list(rc2),
+                                    "filter_raw": list(filt2)})
+            self.write_done.emit(
+                f"预设「{preset.get('name', '')}」已应用并保存到闪存 ✅")
+        except KeyError as e:
+            self.error.emit(f"预设文件缺少字段：{e}")
+        except (MspError, serial.SerialException) as e:
+            self.error.emit(f"应用预设失败：{e}")
+        except Exception as e:
+            self.error.emit(f"应用预设时发生未知错误：{e}")
 
     # ---------- 断开 ----------
 
@@ -1611,18 +1908,21 @@ class MainWindow(QMainWindow):
         self.sidebar.setFixedWidth(150)
         self.sidebar.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # 隐藏横向滚动条
-        self.sidebar.addItems(["📊  仪表盘", "🎛️  PID 调参",
-                               "⚙️  电机测试", "📡  接收机", "📈  黑匣子",
-                               "🤖  AI 助手"])
+        self.sidebar.addItems(["📊  仪表盘", "🎛️  PID 调参", "🎯  Rates 调参",
+                               "🌊  滤波器", "⚙️  电机测试", "📡  接收机",
+                               "📈  黑匣子", "💾  调参方案", "🤖  AI 助手"])
         self.sidebar.setCurrentRow(0)
         body.addWidget(self.sidebar)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_dashboard_tab())
         self.pages.addWidget(self._build_pid_tab())
+        self.pages.addWidget(self._build_rates_tab())
+        self.pages.addWidget(self._build_filter_tab())
         self.pages.addWidget(self._build_motor_tab())
         self.pages.addWidget(self._build_rc_tab())
         self.pages.addWidget(self._build_blackbox_tab())
+        self.pages.addWidget(self._build_preset_tab())
         self.pages.addWidget(self._build_ai_tab())
         body.addWidget(self.pages, 1)
 
@@ -2258,9 +2558,368 @@ class MainWindow(QMainWindow):
         fig.tight_layout()
         self.bb_canvas.draw()
         self.bb_stats_label.setText("\n".join(peak_notes[:6]))
+        # v0.5：噪声峰同步显示到「滤波器」页，辅助设置低通/陷波
+        if hasattr(self, "filter_peak_label"):
+            self.filter_peak_label.setText(
+                "黑匣子噪声峰：" + "；".join(peak_notes[:4])
+                if peak_notes else "黑匣子噪声峰：未找到明显噪声峰")
         self.statusBar().showMessage("频谱分析完成（点「绘制曲线」返回时域图）")
 
-    # ---------- 页签 6：AI 助手（v0.4 新功能） ----------
+    # ---------- 页签 3：Rates 调参（v0.5） ----------
+
+    def _build_rates_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+
+        # 左列：三轴滑块 + 写入按钮
+        left = QVBoxLayout()
+        hint = QLabel("拖动滑块实时预览手感曲线，确认后点「写入飞控」。"
+                      "写入前会自动备份当前全部配置到 backups/ 文件夹。")
+        hint.setWordWrap(True)
+        left.addWidget(hint)
+
+        self._rc_raw = None                   # 23 字节 bytearray
+        self._rates_controls = {}             # {(字段, 轴): (滑块, 数值标签)}
+
+        axes = [("横滚 Roll", 0), ("俯仰 Pitch", 1), ("偏航 Yaw", 2)]
+        fields = [("rc_rate", "中位灵敏度 RC Rate"),
+                  ("rate", "满杆速率 Super Rate"),
+                  ("expo", "中位指数 Expo")]
+        for axis_name, axis in axes:
+            box = QGroupBox(axis_name)
+            grid = QGridLayout(box)
+            for row, (field, field_name) in enumerate(fields):
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(0, 255)       # 存储值 0~255 = 0.00~2.55
+                value_label = QLabel("—")
+                value_label.setMinimumWidth(40)
+                slider.valueChanged.connect(
+                    lambda v, f=field, a=axis: self._on_rates_slider(f, a, v))
+                grid.addWidget(QLabel(field_name), row, 0)
+                grid.addWidget(slider, row, 1)
+                grid.addWidget(value_label, row, 2)
+                self._rates_controls[(field, axis)] = (slider, value_label)
+            left.addWidget(box)
+
+        btns = QHBoxLayout()
+        self.rates_reload_btn = QPushButton("重新读取")
+        self.rates_reload_btn.clicked.connect(self.on_tuning_reload)
+        self.rates_reload_btn.setEnabled(False)
+        btns.addWidget(self.rates_reload_btn)
+        self.rates_write_btn = QPushButton("写入飞控")
+        self.rates_write_btn.setObjectName("connectBtn")
+        self.rates_write_btn.clicked.connect(self.on_tuning_write)
+        self.rates_write_btn.setEnabled(False)
+        btns.addWidget(self.rates_write_btn)
+        btns.addStretch()
+        left.addLayout(btns)
+        left.addStretch()
+        layout.addLayout(left, 1)
+
+        # 右列：手感曲线
+        right = QVBoxLayout()
+        curve_box = QGroupBox("手感曲线（摇杆偏转 → 角速度）")
+        curve_layout = QVBoxLayout(curve_box)
+        if HAS_MPL:
+            self.rates_figure = Figure(figsize=(5, 4), facecolor="#1B1E23")
+            self.rates_canvas = FigureCanvasQTAgg(self.rates_figure)
+            curve_layout.addWidget(self.rates_canvas)
+        else:
+            curve_layout.addWidget(QLabel("未安装 matplotlib，无法绘制曲线"))
+        self.rates_max_label = QLabel("满杆角速度：—")
+        curve_layout.addWidget(self.rates_max_label)
+        right.addWidget(curve_box)
+        layout.addLayout(right, 1)
+        return tab
+
+    # ---------- Rates / 滤波器：数据到达与写回 ----------
+
+    def on_tuning_reload(self):
+        self.statusBar().showMessage("正在读取 Rates 与滤波器配置……")
+        self._run_in_thread(self.worker.read_tuning)
+
+    def on_tuning_ready(self, data: dict):
+        """Rates/滤波器数据到达（连接后、写入后、手动读取都会触发）"""
+        try:
+            self._rc_raw = bytearray(data["rc_raw"])
+            parsed = parse_rc_tuning(bytes(self._rc_raw))
+            for (field, axis), (slider, label) in \
+                    self._rates_controls.items():
+                slider.blockSignals(True)
+                slider.setValue(round(parsed[field][axis] * 100))
+                slider.blockSignals(False)
+                label.setText(f"{parsed[field][axis]:.2f}")
+            self._draw_rates_curve()
+            self.rates_write_btn.setEnabled(True)
+        except (MspError, KeyError, TypeError):
+            self._rc_raw = None
+            self.rates_write_btn.setEnabled(False)
+        try:
+            self._filter_raw = bytearray(data["filter_raw"])
+            values = parse_filter_config(bytes(self._filter_raw))
+            for key, spin in self._filter_spins.items():
+                spin.blockSignals(True)
+                spin.setValue(values[key])
+                spin.blockSignals(False)
+            self.filter_write_btn.setEnabled(True)
+        except (MspError, KeyError, TypeError):
+            self._filter_raw = None
+            self.filter_write_btn.setEnabled(False)
+
+    def _on_rates_slider(self, field: str, axis: int, value: int):
+        """滑块变化：只更新本地数据与曲线，确认后才写飞控"""
+        if self._rc_raw is None:
+            return
+        set_rc_value(self._rc_raw, field, axis, value / 100)
+        _slider, label = self._rates_controls[(field, axis)]
+        label.setText(f"{value / 100:.2f}")
+        self._draw_rates_curve()
+
+    def _draw_rates_curve(self):
+        """按当前滑块值绘制三轴手感曲线"""
+        if not HAS_MPL or self._rc_raw is None:
+            return
+        parsed = parse_rc_tuning(bytes(self._rc_raw))
+        fig = self.rates_figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#1B1E23")
+        sticks = [i / 100 for i in range(101)]
+        colors = ["#3EC6E8", "#F5A83D", "#7CE38B"]
+        names = ["横滚", "俯仰", "偏航"]
+        maxes = []
+        for axis in range(3):
+            curve = [bf_rate_curve(s, parsed["rc_rate"][axis],
+                                   parsed["rate"][axis],
+                                   parsed["expo"][axis]) for s in sticks]
+            ax.plot([s * 100 for s in sticks], curve, color=colors[axis],
+                    linewidth=1.2, label=names[axis])
+            maxes.append(f"{names[axis]} {curve[-1]:.0f}")
+        title = "手感曲线"
+        if parsed.get("rates_type", 0) != 0:
+            title += "（固件使用非经典 Rates 类型，曲线仅供参考）"
+        ax.set_title(title, color="#3EC6E8")
+        ax.set_xlabel("摇杆偏转 (%)", color="#E8E8E8")
+        ax.set_ylabel("角速度 (°/s)", color="#E8E8E8")
+        ax.legend(loc="upper left", fontsize=8, facecolor="#23272E",
+                  labelcolor="#E8E8E8")
+        ax.grid(True, alpha=0.2, color="#9AA0A6")
+        ax.tick_params(colors="#9AA0A6")
+        for spine in ax.spines.values():
+            spine.set_color("#363C44")
+        fig.tight_layout()
+        self.rates_canvas.draw()
+        self.rates_max_label.setText(
+            "满杆角速度：" + " ｜ ".join(maxes) + " °/s")
+
+    def on_tuning_write(self):
+        """把 Rates 与滤波器一起写入飞控（一次 EEPROM 保存）"""
+        if self._rc_raw is None or self._filter_raw is None:
+            self.statusBar().showMessage(
+                "配置尚未读取完整：请先连接飞控或点「重新读取」")
+            return
+        # 安全检查：低通设为 0 = 关闭滤波，需要额外警告
+        warnings = []
+        values = parse_filter_config(bytes(self._filter_raw))
+        if values["gyro_lpf1_hz"] == 0 or values["dterm_lpf1_hz"] == 0:
+            warnings.append("陀螺仪或 D 项低通被设为 0（关闭滤波），"
+                            "噪声可能烧毁电机/电调！")
+        msg = ("将把当前 Rates 与滤波器设置写入飞控并保存到闪存。\n"
+               "写入前会自动备份当前全部配置到 backups/ 文件夹。\n\n")
+        if warnings:
+            msg += "⚠️ " + "\n⚠️ ".join(warnings) + "\n\n"
+        msg += "确定继续吗？"
+        reply = QMessageBox.question(self, "确认写入", msg)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run_in_thread(self.worker.write_tuning,
+                            list(self._rc_raw), list(self._filter_raw))
+
+    # ---------- 页签 4：滤波器（v0.5） ----------
+
+    def _build_filter_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        hint = QLabel("滤波器用于压制机架振动噪声。截止频率 0 = 关闭该滤波器"
+                      "（危险！）。建议先在「黑匣子」页做频谱分析，"
+                      "找到噪声峰后再调整。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._filter_raw = None               # 49 字节 bytearray
+        self._filter_spins = {}               # {键名: QSpinBox}
+
+        name_map = {k: n for k, n, _o, _t, _lo, _hi in FILTER_FIELDS}
+        range_map = {k: (lo, hi) for k, _n, _o, _t, lo, hi in FILTER_FIELDS}
+        groups = [
+            ("静态低通（常用）", ["gyro_lpf1_hz", "gyro_lpf2_hz",
+                              "dterm_lpf1_hz", "dterm_lpf2_hz", "yaw_lpf_hz"]),
+            ("动态低通", ["gyro_dyn_min", "gyro_dyn_max",
+                        "dterm_dyn_min", "dterm_dyn_max", "dyn_expo"]),
+            ("动态陷波", ["notch_q", "notch_min", "notch_max", "notch_count"]),
+            ("RPM 滤波", ["rpm_harmonics", "rpm_min_hz"]),
+        ]
+        group_row = QHBoxLayout()
+        for group_name, keys in groups:
+            box = QGroupBox(group_name)
+            form = QFormLayout(box)
+            for key in keys:
+                spin = QSpinBox()
+                lo, hi = range_map[key]
+                spin.setRange(lo, hi)
+                spin.setMaximumWidth(110)
+                spin.valueChanged.connect(
+                    lambda v, k=key: self._on_filter_spin(k, v))
+                form.addRow(name_map[key] + "：", spin)
+                self._filter_spins[key] = spin
+            group_row.addWidget(box)
+        layout.addLayout(group_row)
+
+        # 与黑匣子频谱联动：显示最近一次 FFT 找到的噪声峰
+        self.filter_peak_label = QLabel("黑匣子噪声峰：尚未做频谱分析"
+                                        "（黑匣子页 → 频谱分析）")
+        self.filter_peak_label.setWordWrap(True)
+        self.filter_peak_label.setStyleSheet("color: #9AA0A6;")
+        layout.addWidget(self.filter_peak_label)
+
+        btns = QHBoxLayout()
+        self.filter_reload_btn = QPushButton("重新读取")
+        self.filter_reload_btn.clicked.connect(self.on_tuning_reload)
+        self.filter_reload_btn.setEnabled(False)
+        btns.addWidget(self.filter_reload_btn)
+        self.filter_write_btn = QPushButton("写入飞控")
+        self.filter_write_btn.setObjectName("connectBtn")
+        self.filter_write_btn.clicked.connect(self.on_tuning_write)
+        self.filter_write_btn.setEnabled(False)
+        btns.addWidget(self.filter_write_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+        layout.addStretch()
+        return tab
+
+    def _on_filter_spin(self, key: str, value: int):
+        """滤波器数值变化：只更新本地数据，确认后才写飞控"""
+        if self._filter_raw is None:
+            return
+        set_filter_value(self._filter_raw, key, value)
+
+    # ---------- 页签 8：调参方案（v0.5） ----------
+
+    def _build_preset_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        hint = QLabel("预设 = 一整套调参状态（PID + Rates + 滤波器）。\n"
+                      "把当前飞控状态保存为预设，之后可一键切换；"
+                      "应用前会自动备份当前配置，随时可以调回来。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.preset_list = QListWidget()
+        layout.addWidget(self.preset_list, 1)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("预设名称："))
+        self.preset_name_edit = QLineEdit()
+        self.preset_name_edit.setPlaceholderText("例如：花飞手感 / 竞速稳拍")
+        name_row.addWidget(self.preset_name_edit, 1)
+        layout.addLayout(name_row)
+
+        btns = QHBoxLayout()
+        self.preset_save_btn = QPushButton("💾 保存当前为预设")
+        self.preset_save_btn.setObjectName("connectBtn")
+        self.preset_save_btn.clicked.connect(self.on_preset_save)
+        self.preset_save_btn.setEnabled(False)
+        btns.addWidget(self.preset_save_btn)
+        self.preset_apply_btn = QPushButton("✅ 应用选中预设")
+        self.preset_apply_btn.clicked.connect(self.on_preset_apply)
+        self.preset_apply_btn.setEnabled(False)
+        btns.addWidget(self.preset_apply_btn)
+        self.preset_delete_btn = QPushButton("🗑️ 删除选中")
+        self.preset_delete_btn.setObjectName("dangerBtn")
+        self.preset_delete_btn.clicked.connect(self.on_preset_delete)
+        btns.addWidget(self.preset_delete_btn)
+        self.preset_refresh_btn = QPushButton("🔄 刷新列表")
+        self.preset_refresh_btn.clicked.connect(self.refresh_preset_list)
+        btns.addWidget(self.preset_refresh_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        self.refresh_preset_list()
+        return tab
+
+    # ---------- 调参方案：列表与操作 ----------
+
+    def refresh_preset_list(self):
+        """扫描 presets/ 目录刷新预设列表"""
+        if not hasattr(self, "preset_list"):
+            return
+        self.preset_list.clear()
+        PRESETS_DIR.mkdir(exist_ok=True)
+        for path in sorted(PRESETS_DIR.glob("*.json"), reverse=True):
+            try:
+                data = load_preset_file(path)
+                item = QListWidgetItem(
+                    f"{data.get('name', path.stem)}　"
+                    f"（{data.get('saved_time', '')[:16]} · "
+                    f"{data.get('board', '')}）")
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self.preset_list.addItem(item)
+            except Exception:
+                self.preset_list.addItem(
+                    QListWidgetItem(f"{path.name}（文件损坏）"))
+
+    def _selected_preset_path(self):
+        item = self.preset_list.currentItem()
+        if not item:
+            return None
+        p = item.data(Qt.ItemDataRole.UserRole)
+        return Path(p) if p else None
+
+    def on_preset_save(self):
+        name = self.preset_name_edit.text().strip()
+        if not name:
+            self.statusBar().showMessage("请先输入预设名称")
+            return
+        self._run_in_thread(self.worker.capture_preset, name)
+
+    def on_preset_apply(self):
+        path = self._selected_preset_path()
+        if not path:
+            self.statusBar().showMessage("请先在列表中选择一个预设")
+            return
+        try:
+            preset = load_preset_file(path)
+        except Exception as e:
+            self.on_error(f"预设文件读取失败：{e}")
+            return
+        reply = QMessageBox.question(
+            self, "确认应用预设",
+            f"将把预设「{preset.get('name', path.stem)}」完整写入飞控\n"
+            "（PID + Rates + 滤波器）并保存到闪存。\n"
+            "写入前会自动备份当前配置到 backups/ 文件夹。\n\n确定继续吗？")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run_in_thread(self.worker.apply_preset, preset)
+
+    def on_preset_delete(self):
+        path = self._selected_preset_path()
+        if not path:
+            self.statusBar().showMessage("请先在列表中选择一个预设")
+            return
+        reply = QMessageBox.question(
+            self, "确认删除", f"将删除预设文件：\n{path}\n\n确定吗？")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            path.unlink()
+            self.refresh_preset_list()
+            self.statusBar().showMessage("预设已删除")
+        except OSError as e:
+            self.on_error(f"删除失败：{e}")
+
+    # ---------- 页签 9：AI 助手（v0.4 新功能） ----------
 
     def _build_ai_tab(self) -> QWidget:
         """AI 助手页：连接本机 Ollama 大模型，做调参问答与数据分析"""
@@ -2498,6 +3157,7 @@ class MainWindow(QMainWindow):
         self.worker.motor_count_ready.connect(self.on_motor_count)
         self.worker.flash_progress.connect(self.statusBar().showMessage)
         self.worker.flash_done.connect(self.on_flash_done)
+        self.worker.tuning_ready.connect(self.on_tuning_ready)
         self.worker.error.connect(self.on_error)
         self.worker.status.connect(self.statusBar().showMessage)
         # AI 助手信号
@@ -2583,7 +3243,9 @@ class MainWindow(QMainWindow):
         self.motors_label.setText(info.get("motors", "未知"))
         self.disconnect_button.setEnabled(True)
         for btn in (self.pid_reload_btn, self.pid_write_btn,
-                    self.pid_backup_btn, self.pid_restore_btn):
+                    self.pid_backup_btn, self.pid_restore_btn,
+                    self.rates_reload_btn, self.filter_reload_btn,
+                    self.preset_save_btn, self.preset_apply_btn):
             btn.setEnabled(True)
         self.bb_flash_btn.setEnabled(True)    # 连接后允许从飞控下载黑匣子
         self.poll_timer.start()               # 开始慢通道轮询
@@ -2630,6 +3292,7 @@ class MainWindow(QMainWindow):
 
     def on_write_done(self, message: str):
         self.statusBar().showMessage(message.splitlines()[0])
+        self.refresh_preset_list()            # 保存预设后刷新列表
         QMessageBox.information(self, "ApexFlight", message)
 
     def on_motor_count(self, count: int):
@@ -2796,8 +3459,13 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(True)
         self.disconnect_button.setEnabled(False)
         for btn in (self.pid_reload_btn, self.pid_write_btn,
-                    self.pid_backup_btn, self.pid_restore_btn):
+                    self.pid_backup_btn, self.pid_restore_btn,
+                    self.rates_reload_btn, self.rates_write_btn,
+                    self.filter_reload_btn, self.filter_write_btn,
+                    self.preset_save_btn, self.preset_apply_btn):
             btn.setEnabled(False)
+        self._rc_raw = None
+        self._filter_raw = None
         self.bb_flash_btn.setEnabled(False)
         self.firmware_label.setText("未连接")
         self.board_label.setText("未连接")
