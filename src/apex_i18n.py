@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.97"
+APP_VERSION = "0.98"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -32,6 +32,7 @@ _EN = {
     "仪表盘": "Dashboard", "PID 调参": "PID Tuning", "Rates 调参": "Rates",
     "滤波器": "Filters", "电机测试": "Motors", "接收机": "Receiver",
     "黑匣子": "Blackbox", "调参方案": "Presets", "AI 助手": "AI Assistant",
+    "扫频调参": "Sweep Tune",
     "日志": "Log",
     "串口": "Port", "刷新": "Refresh", "波特率": "Baud",
     "连接": "Connect", "断开": "Disconnect", "设置": "Settings",
@@ -88,9 +89,19 @@ _EN = {
     "搜索地点，如：柳州": "Search a place, e.g. Liuzhou",
     "搜索": "Search",
     "同步 UOM 适飞区": "Sync UOM fly zones",
+    "用黑匣子页当前日志": "Use current Blackbox log",
+    "开始分析": "Analyze", "未选择日志": "No log selected",
+    "三轴辨识指标": "Per-axis metrics",
+    "扫频精准调参（实测数据 + 数学推导，不用 AI 猜）":
+        "Sweep tuning (measured data + math, no AI guessing)",
+    "精准调参建议（每条都带数学依据）":
+        "Precise suggestions (each with math rationale)",
+    "应用 PID 建议到飞控": "Apply PID suggestions to FC",
     "UOM 适飞区同步": "UOM fly-zone sync",
     "单击地图放置起飞点标记，坐标供 UOM 空域申请填表使用":
         "Click the map to drop a takeoff marker; coordinates ready for UOM airspace forms",
+    "滤波器类建议请到「滤波器」页按建议频率手动调整；首次应用后请拆桨低空试飞验证":
+        "Apply filter suggestions manually on the Filters page; verify with a careful first flight",
     "复制坐标": "Copy coordinates",
     "参数": "Parameter", "当前值": "Current",
     "建议值": "Suggested", "变化": "Change",
