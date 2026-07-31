@@ -11,12 +11,20 @@ import serial
 
 from apex_msp import *  # noqa: F401,F403
 
-# 项目根目录（src 的上一级）与备份文件夹
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 项目根目录（src 的上一级）与备份文件夹。
+# 打包适配（v0.9）：PyInstaller 冻结后，用户数据（备份/日志/预设/配置）
+# 放在 exe 同级目录；程序资源（图标/解码器）在 PyInstaller 解压的临时目录。
+import sys as _sys
+if getattr(_sys, "frozen", False):
+    PROJECT_ROOT = Path(_sys.executable).resolve().parent
+    _BUNDLE_ROOT = Path(getattr(_sys, "_MEIPASS", PROJECT_ROOT))
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    _BUNDLE_ROOT = PROJECT_ROOT
 BACKUP_DIR = PROJECT_ROOT / "backups"
-ICON_PATH = PROJECT_ROOT / "assets" / "icon.png"
+ICON_PATH = _BUNDLE_ROOT / "assets" / "icon.png"
 # 官方黑匣子解码器（cleanflight/blackbox-tools，可把 .bbl/.bfl 转成 CSV）
-BLACKBOX_DECODER = PROJECT_ROOT / "tools" / "blackbox_decode.exe"
+BLACKBOX_DECODER = _BUNDLE_ROOT / "tools" / "blackbox_decode.exe"
 # 演示日志存放目录
 LOGS_DIR = PROJECT_ROOT / "logs"
 

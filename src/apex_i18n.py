@@ -7,12 +7,17 @@
 """
 
 import json
+import sys
 from pathlib import Path
 
 APP_VERSION = "0.9"
 APP_NAME = "ApexFlight"
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+# 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
+if getattr(sys, "frozen", False):
+    CONFIG_PATH = Path(sys.executable).resolve().parent / "config.json"
+else:
+    CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 _current_lang = "zh"
 

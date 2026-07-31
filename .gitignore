@@ -39,5 +39,7 @@ logs/
 # ---- 本地工具安装包（体积大，不入库） ----
 tools/*.exe
 
-# ---- 开发调试脚本（不上库） ----
-src/_*.py
+# ---- 打包生成的杂项 ----
+*.spec
+assets/icon.ico
+config.json
