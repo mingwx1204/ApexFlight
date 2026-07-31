@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.99"
+APP_VERSION = "1.00"
 APP_NAME = "ApexFlight"
 
 # 配置文件位置：开发时在项目根目录；打包后在 exe 同级目录
@@ -135,6 +135,10 @@ _EN = {
     "我已拆下螺旋桨，启用电机测试":
         "Props removed - enable motor test",
     "主控": "Master",
+    "模型下载分片": "Model download segments",
+    "{n} 线程分片": "{n} threads",
+    "下载 AI 模型时的并发分片数（越多越快，但太大会被服务器限速）":
+        "Concurrent download segments for AI models (more = faster, but too many gets throttled)",
     # ---- 日志页 ----
     "应用日志": "Application log", "（暂无日志）": "(no log yet)",
     "日志已清空": "Log cleared", "日志文件 (*.txt)": "Log files (*.txt)",

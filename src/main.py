@@ -1120,6 +1120,16 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
             0 if self._cfg.get("units", "metric") == "metric" else 1)
         form.addRow(tr("基础单位") + "：", units_combo)
 
+        # AI 模型下载分片数（v1.00）：Motrix 式多线程分片并发
+        seg_combo = QComboBox()
+        for n in (8, 16, 32, 64):
+            seg_combo.addItem(tr("{n} 线程分片").format(n=n), n)
+        cur_seg = int(self._cfg.get("dl_segments", 16))
+        seg_combo.setCurrentIndex({8: 0, 16: 1, 32: 2, 64: 3}.get(cur_seg, 1))
+        seg_combo.setToolTip(tr(
+            "下载 AI 模型时的并发分片数（越多越快，但太大会被服务器限速）"))
+        form.addRow(tr("模型下载分片") + "：", seg_combo)
+
         log_btn = QPushButton(tr("打开日志文件夹"))
         log_btn.clicked.connect(self._open_log_folder)
         form.addRow(tr("日志") + "：", log_btn)
@@ -1158,6 +1168,7 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
         self._cfg["language"] = lang_combo.currentData()
         self._cfg["baud"] = baud_combo.currentText()
         self._cfg["units"] = units_combo.currentData()
+        self._cfg["dl_segments"] = seg_combo.currentData()
         i18n.save_config(self._cfg)
         self.baud_combo.setCurrentText(self._cfg["baud"])
         if hasattr(self, "map_widget"):
@@ -3023,17 +3034,33 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
         self.ai_pull_btn.setEnabled(False)
         self.ai_pull_btn.setText(f"⏳ 正在拉取 {model} …")
         self.ai_chat_view.append(
-            f"<span style='color:#9AA0A6;'>📥 开始下载模型 {model}，"
-            f"模型较大可能要几分钟，进度见底部状态栏……</span>")
+            f"<span style='color:#9AA0A6;'>⚡ 开始多线程下载模型 {model}"
+            f"（分片并发，进度见底部状态栏；失败自动回退官方下载）……</span>")
         self._pull_progress = f"正在连接 Ollama 拉取 {model} ……"
         self._pull_timer = QTimer(self)
         self._pull_timer.setInterval(600)
         self._pull_timer.timeout.connect(
             lambda: self.statusBar().showMessage(
-                "📥 " + str(getattr(self, "_pull_progress", ""))[:90]))
+                str(getattr(self, "_pull_progress", ""))[:110]))
         self._pull_timer.start()
 
         def work():
+            # ① 首选：Motrix 式多线程分片下载（直写 Ollama 模型库）
+            try:
+                from apex_ollama_dl import pull_model_multithread
+                segs = int(self._cfg.get("dl_segments", 16))
+
+                def _prog(t):
+                    self._pull_progress = "⚡ " + t
+
+                err = pull_model_multithread(model, segs, _prog)
+                if err is None:
+                    return 0
+                self._pull_progress = f"多线程下载失败（{err}），改用官方下载…"
+                time.sleep(2)
+            except Exception:
+                pass
+            # ② 保底：官方 ollama pull（单连接）
             try:
                 import re
                 import subprocess
@@ -3049,7 +3076,7 @@ class MainWindow(MapTabMixin, SweepTabMixin, MotorTabMixin,
                     # \r 原地刷新的进度在 text 模式下已拆成多行
                     line = ansi.sub("", line).replace("\x1b", "").strip()
                     if line:
-                        self._pull_progress = line   # 状态栏轮询读取
+                        self._pull_progress = "📥 " + line
                 return proc.wait()
             except Exception as e:
                 return f"error:{e}"
